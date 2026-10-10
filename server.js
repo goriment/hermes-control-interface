@@ -374,6 +374,10 @@ function discoverGatewayPorts() {
       } catch (_) { /* skip broken config */ }
     }
   } catch (_) { /* no profiles dir */ }
+  const sharedPort = Number(process.env.HERMES_GATEWAY_PORT || 0);
+  if (!ports.default && Number.isInteger(sharedPort) && sharedPort > 0 && sharedPort < 65536) {
+    ports.default = sharedPort;
+  }
   return ports;
 }
 
@@ -1870,8 +1874,9 @@ const tokenToUser = new Map(); // token -> { username, role }
 
 function createAuthToken(username, role, permissions) {
   const ts = String(Date.now());
+  const encodedUser = Buffer.from(username, 'utf8').toString('base64url');
   const sig = hmac(ts + ':' + username);
-  const token = ts + '.' + sig;
+  const token = ts + '.' + encodedUser + '.' + sig;
   tokenToUser.set(token, { username, role, permissions });
   return token;
 }
@@ -1880,7 +1885,34 @@ function getCurrentUser(req) {
   const cookies = parseCookies(req);
   const token = cookies[AUTH_COOKIE];
   if (!token) return null;
-  return tokenToUser.get(token) || null;
+
+  const cached = tokenToUser.get(token);
+  if (cached) return cached;
+
+  // Rehydrate a signed session after an HCI restart instead of forcing a login loop.
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [ts, encodedUser, sig] = parts;
+  const issuedAt = Number(ts);
+  if (!Number.isFinite(issuedAt) || Date.now() - issuedAt > 24 * 60 * 60 * 1000 || issuedAt > Date.now() + 60_000) return null;
+
+  let username;
+  try {
+    username = Buffer.from(encodedUser, 'base64url').toString('utf8');
+  } catch {
+    return null;
+  }
+  if (!sanitizeUsername(username) || !safeTimingEqual(sig, hmac(ts + ':' + username))) return null;
+
+  const user = findUser(username);
+  if (!user) return null;
+  const restored = {
+    username: user.username,
+    role: user.role,
+    permissions: resolvePermissions(user.role, user.permissions),
+  };
+  tokenToUser.set(token, restored);
+  return restored;
 }
 
 function requireRole(role) {
@@ -3235,7 +3267,7 @@ app.put('/api/office/departments/:id/members', requireRole('admin'), requireCsrf
 function checkAgentAlive(name) {
   // gatewayPorts is set at server startup by discoverGatewayPorts()
   // e.g. { default: 8642, david: 8645, cuan: 8650, soci: 8650 }
-  return typeof gatewayPorts === 'object' && gatewayPorts !== null && name in gatewayPorts;
+  return typeof gatewayPorts === 'object' && gatewayPorts !== null && (name in gatewayPorts || 'default' in gatewayPorts);
 }
 // Parse agent state from `hermes -p <name> status` output (legacy — kept for reference)
 function parseOfficeAgentState(stdout, profileName) {
@@ -3328,7 +3360,7 @@ app.get('/api/office/agent-states', requireAuth, async (req, res) => {
 
     // FAST hybrid: config.yaml + kanban.db (no subprocess spawn)
     // ~100ms vs ~3000ms for `hermes status`
-    const kanbanDB = openKanbanDB('main');
+    const kanbanDB = openKanbanDB(String(req.query.board || 'main'));
     
     for (const name of namesToQuery) {
       const { department, deptColor, deptId, unassigned } = deptLookup[name];
@@ -3428,10 +3460,18 @@ function collectOfficeEvents() {
 
     for (const lp of logPaths) {
       if (!fs.existsSync(lp)) continue;
-      const out = require('child_process').execSync(
-        `tail -n 300 "${lp}" 2>/dev/null || true`, { encoding: 'utf8', timeout: 3000 }
-      );
-      const lines = String(out || '').split('\n').reverse();
+      // Cross-platform, non-shell tail: avoid blocking the Node event loop on Windows.
+      const stat = fs.statSync(lp);
+      const maxBytes = 256 * 1024;
+      const start = Math.max(0, stat.size - maxBytes);
+      const fd = fs.openSync(lp, 'r');
+      const buf = Buffer.alloc(stat.size - start);
+      try {
+        fs.readSync(fd, buf, 0, buf.length, start);
+      } finally {
+        fs.closeSync(fd);
+      }
+      const lines = buf.toString('utf8').split(/\r?\n/).slice(-300).reverse();
 
       for (const line of lines) {
         if (events.length >= MAX) break;
@@ -3708,7 +3748,7 @@ app.post('/api/office/kanban/:taskId/action', requireAuth, requireCsrf, (req, re
   try {
     const taskId = String(req.params.taskId).replace(/[^a-zA-Z0-9_-]/g, '');
     const board = String(req.query.board || 'main').replace(/[^a-zA-Z0-9_-]/g, '');
-    const { action, assignee } = req.body || {};
+    const { action, assignee, text } = req.body || {};
     const now = Math.floor(Date.now() / 1000);
 
     const db = openKanbanDBWritable(board);
@@ -3717,11 +3757,40 @@ app.post('/api/office/kanban/:taskId/action', requireAuth, requireCsrf, (req, re
     const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
     if (!task) { db.close(); return res.json({ ok: false, error: 'task not found' }); }
 
+    const saveDecision = (resume) => {
+      const body = String(text || '').trim().slice(0, 8000);
+      if (!body) return { error: 'decision text is required' };
+      const author = 'hci-admin';
+      const tx = db.transaction(() => {
+        db.prepare('INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)').run(taskId, author, body, now);
+        db.prepare('INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)').run(
+          taskId,
+          task.current_run_id || null,
+          'commented',
+          JSON.stringify({ author, len: body.length, source: 'hci-decision' }),
+          now,
+        );
+        if (resume) {
+          db.prepare("UPDATE tasks SET status='ready', completed_at=NULL, block_kind=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=?").run(taskId);
+          db.prepare('INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, NULL, ?, ?, ?)').run(
+            taskId,
+            'decision_submitted',
+            JSON.stringify({ author, resume: true }),
+            now,
+          );
+        }
+      });
+      tx();
+      return { changes: 1 };
+    };
+
     const validActions = {
       unblock:  () => db.prepare('UPDATE tasks SET status=?, completed_at=NULL WHERE id=?').run('ready', taskId),
       done:     () => db.prepare('UPDATE tasks SET status=?, completed_at=? WHERE id=?').run('done', now, taskId),
       reopen:   () => db.prepare('UPDATE tasks SET status=?, completed_at=NULL, started_at=NULL WHERE id=?').run('todo', taskId),
-      start:    () => db.prepare('UPDATE tasks SET status=?, started_at=? WHERE id=?').run('running', now, taskId),
+      start:    () => db.prepare("UPDATE tasks SET status='ready', completed_at=NULL, claim_lock=NULL, claim_expires=NULL WHERE id=?").run(taskId),
+      comment:  () => saveDecision(false),
+      respond:  () => saveDecision(true),
       reassign: () => {
         const newAssignee = String(assignee || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32);
         if (!newAssignee) return { error: 'assignee is required for reassign' };
@@ -5720,6 +5789,8 @@ const mcpProcesses = {}; // { name: { pid, status, started, logs: [], port, cmd 
  * Returns { running: bool, pid: number|null, uptime: number|null }.
  */
 function _detectMcpServerAlive(serverName, serverConfig) {
+  // The upstream probe uses Linux pgrep/proc and blocks the entire Node event loop on Windows.
+  if (process.platform === 'win32') return { running: false, pid: null, uptime: null };
   try {
     const cmd = serverConfig.command || '';
     if (!cmd) return { running: false, pid: null, uptime: null };

@@ -13,10 +13,8 @@ async function loadOffice(container) {
           <div class="page-subtitle" data-i18n="auto.agentWorkspaceVisualization">Kanban board — live task visualization</div>
         </div>
         <div style="display:flex;gap:8px;" id="office-controls">
-          <button class="btn btn-ghost btn-sm" onclick="if(window.switchKanbanBoard)switchKanbanBoard('main')">📋 main</button>
-          <button class="btn btn-ghost btn-sm" onclick="if(window.switchKanbanBoard)switchKanbanBoard('dev')">🛠 dev</button>
-          <button class="btn btn-ghost btn-sm" onclick="if(window.switchKanbanBoard)switchKanbanBoard('content')">📝 content</button>
-          <button class="btn btn-ghost btn-sm" onclick="if(window.switchKanbanBoard)switchKanbanBoard('trading')">💹 trading</button>
+          <button class="btn btn-ghost btn-sm btn-active" onclick="if(window.switchKanbanBoard)switchKanbanBoard('goriment-control')">🎛 goriment-control</button>
+          <button class="btn btn-ghost btn-sm" onclick="if(window.switchKanbanBoard)switchKanbanBoard('goriment-worker-canary')">🐤 goriment-worker-canary</button>
         </div>
       </div>
       <div id="office-kanban-root"></div>
@@ -24,7 +22,7 @@ async function loadOffice(container) {
   `;
 
   // Init PixiJS Kanban in the root div
-  await initKanbanBoard('office-kanban-root', 'main');
+  await initKanbanBoard('office-kanban-root', 'goriment-control');
   startKanbanPoll(30000);
 }
 
