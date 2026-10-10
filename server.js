@@ -246,6 +246,16 @@ app.use('/api', (req, res, next) => {
   res.setHeader('Expires', '0');
   next();
 });
+// Only routes on the rbac.ROUTE_POLICY allow-list are reachable by restricted roles, regardless
+// of what an individual route checks (defence in depth; new routes are denied by default).
+app.use(['/api', '/usage', '/plugins'], (req, res, next) => {
+  const user = getCurrentUser(req);
+  if (!user || !rbac.isRestricted(user)) return next();
+  req.hciUser = user;
+  const verdict = rbac.policyCheck(user, req.method, req.baseUrl + req.path);
+  if (verdict.allowed) return next();
+  return denyRequest(req, res, 403, verdict.reason || 'forbidden', 'restricted role');
+});
 app.use('/vendor/xterm', express.static(path.join(__dirname, 'node_modules/@xterm/xterm'), { maxAge: '30d' }));
 app.use('/vendor/xterm-addon-fit', express.static(path.join(__dirname, 'node_modules/@xterm/addon-fit'), { maxAge: '30d' }));
 
@@ -298,6 +308,9 @@ app.get('/api/plugins', requireRole('admin'), (req, res) => {
 
 // Serve plugin static files (UI assets)
 app.use('/plugins/:id', (req, res, next) => {
+  const who = getCurrentUser(req);
+  if (!who) return res.status(401).json({ error: 'authentication required' });
+  if (rbac.isRestricted(who)) return res.status(403).json({ error: 'not available to this role' });
   const plugins = findPluginManifests();
   const plugin = plugins.find(p => p.id === req.params.id);
   if (!plugin) return res.status(404).json({ error: 'plugin not found' });
@@ -942,12 +955,13 @@ function requireAuth(req, res, next) {
 }
 
 function requireProfileAccess(req, res, next) {
-  const profile = req.params.profile || req.body?.profile;
+  const user = getCurrentUser(req);
+  if (!user) return res.status(401).json({ error: 'authentication required' });
+  req.hciUser = user;
+  const profile = req.params.profile || req.body?.profile || req.query?.profile;
   if (!profile) return next();
-  const currentUser = getCurrentUser(req);
-  const user = currentUser ? findUser(currentUser.username) : null;
-  if (!canAccessProfile(user, profile)) {
-    return res.status(403).json({ error: 'access denied to this profile' });
+  if (!rbac.canAccessProfile(user, String(profile))) {
+    return denyRequest(req, res, 403, 'access denied to this profile', `profile=${String(profile).slice(0, 40)}`);
   }
   return next();
 }
@@ -1855,47 +1869,42 @@ app.get('/api/session', requireAuth, (req, res) => {
 const {
   isFirstRun, findUser, createUser, deleteUser,
   verifyUserPassword, changePassword, resetUserPassword, sanitizeUsername, listUsers,
-  updateUserPermissions, updateUserProfiles, canAccessProfile, PERMISSIONS, PRESET_PERMISSIONS, resolvePermissions,
+  updateUserPermissions, updateUserProfiles, canAccessProfile, buildPrincipal, rbac, PERMISSIONS, PRESET_PERMISSIONS, resolvePermissions,
   audit, getAuditLog,
   loadNotifications, addNotification, dismissNotification, clearNotifications,
 } = require('./auth');
 
-// Periodic cleanup of expired auth tokens (every 15 minutes)
+// ── Session tokens ─────────────────────────────────────────────────────────
+// Token = <issuedAtMs>.<base64url(username)>.<hmac(ts:username)>. The token carries identity ONLY;
+// role, permissions, profile/board scope and expiry are re-read from the user store on EVERY request
+// (see getCurrentUser), so an admin change, account expiry, or deletion takes effect immediately.
+// Logged-out tokens are remembered in `revokedTokens` until they would expire anyway.
+const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+const revokedTokens = new Map(); // token -> issuedAtMs
+
+// Periodic cleanup of revoked tokens that are past their natural expiry (every 15 minutes)
 const tokenCleanupInterval = setInterval(() => {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [k] of tokenToUser) {
-    const [t] = k.split('.');
-    if (Number(t) < cutoff) tokenToUser.delete(k);
-  }
+  const cutoff = Date.now() - TOKEN_TTL_MS;
+  for (const [k, t] of revokedTokens) if (t < cutoff) revokedTokens.delete(k);
 }, 15 * 60 * 1000);
+if (typeof tokenCleanupInterval.unref === 'function') tokenCleanupInterval.unref();
 
-// Track current user in request (bound to token)
-const tokenToUser = new Map(); // token -> { username, role }
-
-function createAuthToken(username, role, permissions) {
+function createAuthToken(username /* , role, permissions — ignored: re-resolved per request */) {
   const ts = String(Date.now());
   const encodedUser = Buffer.from(username, 'utf8').toString('base64url');
   const sig = hmac(ts + ':' + username);
-  const token = ts + '.' + encodedUser + '.' + sig;
-  tokenToUser.set(token, { username, role, permissions });
-  return token;
+  return ts + '.' + encodedUser + '.' + sig;
 }
 
-function getCurrentUser(req) {
-  const cookies = parseCookies(req);
-  const token = cookies[AUTH_COOKIE];
-  if (!token) return null;
-
-  const cached = tokenToUser.get(token);
-  if (cached) return cached;
-
-  // Rehydrate a signed session after an HCI restart instead of forcing a login loop.
+/** token string -> principal | null (verifies signature, age, revocation, then rebuilds from the store). */
+function principalFromToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  if (revokedTokens.has(token)) return null;
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const [ts, encodedUser, sig] = parts;
   const issuedAt = Number(ts);
-  if (!Number.isFinite(issuedAt) || Date.now() - issuedAt > 24 * 60 * 60 * 1000 || issuedAt > Date.now() + 60_000) return null;
-
+  if (!Number.isFinite(issuedAt) || Date.now() - issuedAt > TOKEN_TTL_MS || issuedAt > Date.now() + 60_000) return null;
   let username;
   try {
     username = Buffer.from(encodedUser, 'base64url').toString('utf8');
@@ -1903,48 +1912,75 @@ function getCurrentUser(req) {
     return null;
   }
   if (!sanitizeUsername(username) || !safeTimingEqual(sig, hmac(ts + ':' + username))) return null;
+  return buildPrincipal(username, issuedAt);
+}
 
-  const user = findUser(username);
-  if (!user) return null;
-  const restored = {
-    username: user.username,
-    role: user.role,
-    permissions: resolvePermissions(user.role, user.permissions),
-  };
-  tokenToUser.set(token, restored);
-  return restored;
+function getCurrentUser(req) {
+  return principalFromToken(parseCookies(req)[AUTH_COOKIE]);
+}
+
+function denyRequest(req, res, status, message, detail) {
+  const u = req.hciUser;
+  audit(u ? u.username : 'unknown', u ? u.role : 'unknown', 'DENIED', `${req.method} ${req.path}${detail ? ' (' + detail + ')' : ''}`);
+  return res.status(status).json({ ok: false, error: message });
 }
 
 function requireRole(role) {
   return (req, res, next) => {
     const user = getCurrentUser(req);
     if (!user) return res.status(401).json({ error: 'authentication required' });
-    if (role === 'admin' && user.role !== 'admin') {
-      audit(user.username, user.role, 'DENIED', `${req.method} ${req.path}`);
-      return res.status(403).json({ error: 'admin access required' });
-    }
     req.hciUser = user;
+    if (role === 'admin' && user.role !== 'admin') {
+      return denyRequest(req, res, 403, 'admin access required');
+    }
     next();
   };
 }
 
-// Permission-based access control
+// Permission-based access control (ALL listed permissions required; admin bypass)
 function requirePerm(...perms) {
   return (req, res, next) => {
     const user = getCurrentUser(req);
     if (!user) return res.status(401).json({ error: 'authentication required' });
-    // Admin always has access
-    if (user.role === 'admin') { req.hciUser = user; return next(); }
-    const userPerms = user.permissions || {};
-    const hasAll = perms.every(p => userPerms[p]);
-    if (!hasAll) {
-      audit(user.username, user.role, 'DENIED', `${req.method} ${req.path} (need: ${perms.join(',')})`);
-      return res.status(403).json({ error: `permission required: ${perms.join(', ')}` });
-    }
     req.hciUser = user;
+    if (user.role === 'admin') return next();
+    if (!perms.every(p => rbac.hasPerm(user, p))) {
+      return denyRequest(req, res, 403, `permission required: ${perms.join(', ')}`, `need: ${perms.join(',')}`);
+    }
     next();
   };
 }
+
+// ANY of the listed permissions is enough (admin bypass)
+function requireAnyPerm(...perms) {
+  return (req, res, next) => {
+    const user = getCurrentUser(req);
+    if (!user) return res.status(401).json({ error: 'authentication required' });
+    req.hciUser = user;
+    if (user.role === 'admin') return next();
+    if (!perms.some(p => rbac.hasPerm(user, p))) {
+      return denyRequest(req, res, 403, `permission required: ${perms.join(' or ')}`, `need any: ${perms.join(',')}`);
+    }
+    next();
+  };
+}
+
+// Principal must be allowed to see EVERY profile (for global/aggregate data with no per-profile split)
+function hasAllProfiles(p) {
+  if (!p) return false;
+  if (p.role === 'admin') return true;
+  if (rbac.isRestricted(p)) return false;
+  return p.allowed_profiles === undefined || p.allowed_profiles === null
+    || (Array.isArray(p.allowed_profiles) && p.allowed_profiles.includes('*'));
+}
+function requireAllProfiles(req, res, next) {
+  const user = getCurrentUser(req);
+  if (!user) return res.status(401).json({ error: 'authentication required' });
+  req.hciUser = user;
+  if (!hasAllProfiles(user)) return denyRequest(req, res, 403, 'this data spans all profiles; your account is profile-scoped');
+  next();
+}
+
 
 // verifyPassword removed — use verifyUserPassword from user store
 
@@ -1958,8 +1994,17 @@ app.get('/api/auth/me', (req, res) => {
   if (!user) return res.status(401).json({ ok: false });
   const cookies = parseCookies(req);
   const csrfToken = deriveCsrfToken(cookies[AUTH_COOKIE]);
-  res.json({ ok: true, user: { username: user.username, role: user.role, permissions: user.permissions }, csrfToken });
+  res.json({ ok: true, user: publicUser(user), csrfToken });
 });
+
+function publicUser(p) {
+  if (!p) return null;
+  return {
+    username: p.username, role: p.role, permissions: p.permissions,
+    allowed_profiles: p.allowed_profiles, allowed_boards: p.allowed_boards,
+    reviewer_scope: p.reviewer_scope, expires_at: p.expires_at,
+  };
+}
 
 // Check if first run (no rate limit, no auth required)
 app.get('/api/auth/status', (req, res) => {
@@ -1989,7 +2034,7 @@ app.post('/api/auth/setup', loginRateLimiter, (req, res) => {
   const result = createUser(username, password, 'admin');
   if (!result.ok) return res.status(400).json(result);
 
-  const authToken = createAuthToken(username, 'admin', PRESET_PERMISSIONS.admin);
+  const authToken = createAuthToken(username);
   setAuthCookie(res, authToken);
   audit(username, 'admin', 'SETUP', 'first-run admin created');
   addNotification('success', `Admin account created: ${username}`);
@@ -2016,15 +2061,15 @@ app.post('/api/auth/login', loginRateLimiter, (req, res) => {
 
   const user = verifyUserPassword(username, password);
   if (!user) {
-    audit(username, 'unknown', 'LOGIN_FAILED', `bad credentials from ${ip}`);
+    audit(username, 'unknown', 'LOGIN_FAILED', `bad credentials or expired account from ${ip}`);
     return res.status(401).json({ ok: false, error: 'Invalid username or password' });
   }
 
-  const authToken = createAuthToken(user.username, user.role, user.permissions);
+  const authToken = createAuthToken(user.username);
   setAuthCookie(res, authToken);
   audit(user.username, user.role, 'LOGIN', `success from ${ip}`);
   const csrfToken = deriveCsrfToken(authToken);
-  res.json({ ok: true, user: { username: user.username, role: user.role, permissions: user.permissions }, csrfToken });
+  res.json({ ok: true, user: publicUser(buildPrincipal(user.username)), csrfToken });
 });
 
 // Logout
@@ -2032,7 +2077,7 @@ app.post('/api/auth/logout', requireAuth, requireCsrf, (req, res) => {
   const user = getCurrentUser(req);
   const cookies = parseCookies(req);
   const token = cookies[AUTH_COOKIE];
-  if (token) tokenToUser.delete(token);
+  if (token) revokedTokens.set(token, Number(String(token).split('.')[0]) || Date.now());
   clearAuthCookie(res);
   if (user) audit(user.username, user.role, 'LOGOUT', '');
   res.json({ ok: true });
@@ -2071,9 +2116,16 @@ app.post('/api/users', requireRole('admin'), requireCsrf, (req, res) => {
   if (password.length < 8) {
     return res.status(400).json({ ok: false, error: 'Password must be at least 8 characters' });
   }
-  const userRole = ['admin', 'viewer', 'custom'].includes(role) ? role : 'viewer';
-  const profiles = userRole === 'admin' ? ['*'] : (Array.isArray(allowed_profiles) ? allowed_profiles : ['*']);
-  const result = createUser(username, password, userRole, profiles);
+  if (role !== undefined && !rbac.ROLES.includes(role)) {
+    return res.status(400).json({ ok: false, error: `Invalid role (allowed: ${rbac.ROLES.join(', ')})` });
+  }
+  const userRole = rbac.ROLES.includes(role) ? role : 'viewer';
+  const profiles = userRole === 'admin' ? ['*'] : (Array.isArray(allowed_profiles) ? allowed_profiles : (rbac.isRestrictedRole(userRole) ? [] : ['*']));
+  const { allowed_boards, reviewer_scope, expires_at } = req.body || {};
+  const result = createUser(username, password, userRole, profiles, {
+    allowed_boards, reviewer_scope, expires_at,
+    permissions: userRole === 'custom' ? permissions : undefined,
+  });
   if (!result.ok) return res.status(400).json(result);
   addNotification('success', `User created: ${username} (${userRole}) profiles=${JSON.stringify(profiles)}`);
   res.json({ ok: true });
@@ -2081,9 +2133,15 @@ app.post('/api/users', requireRole('admin'), requireCsrf, (req, res) => {
 
 // Update user permissions
 app.put('/api/users/:username', requireRole('admin'), requireCsrf, (req, res) => {
-  const { role, permissions } = req.body || {};
-  const userRole = ['admin', 'viewer', 'custom'].includes(role) ? role : 'viewer';
-  const result = updateUserPermissions(req.params.username, userRole, userRole === 'custom' ? permissions : null);
+  const { role, permissions, allowed_profiles, allowed_boards, reviewer_scope, expires_at } = req.body || {};
+  if (role !== undefined && !rbac.ROLES.includes(role)) {
+    return res.status(400).json({ ok: false, error: `Invalid role (allowed: ${rbac.ROLES.join(', ')})` });
+  }
+  const userRole = rbac.ROLES.includes(role) ? role : 'viewer';
+  const result = updateUserPermissions(
+    req.params.username, userRole, userRole === 'custom' ? permissions : null,
+    { allowed_profiles, allowed_boards, reviewer_scope, expires_at }, req.hciUser?.username || 'admin',
+  );
   if (!result.ok) return res.status(400).json(result);
   res.json({ ok: true });
 });
@@ -2126,25 +2184,27 @@ app.get('/api/audit', requireRole('admin'), (req, res) => {
 // ============================================
 // Notifications API
 // ============================================
+// Notifications are admin-operational messages (user creation, password resets, session renames…):
+// admins get them; other roles get an empty list. Dismiss/clear mutate the shared store => admin only.
 app.get('/api/notifications', requireAuth, (req, res) => {
-  const notifs = loadNotifications();
-  res.json({ ok: true, notifications: notifs });
+  const user = getCurrentUser(req);
+  res.json({ ok: true, notifications: user && user.role === 'admin' ? loadNotifications() : [] });
 });
 
 // Support both /api/notifications/:id/dismiss (URL param) and /api/notifications/dismiss (body id)
-app.post('/api/notifications/:id/dismiss', requireAuth, requireCsrf, (req, res) => {
+app.post('/api/notifications/:id/dismiss', requireRole('admin'), requireCsrf, (req, res) => {
   const id = req.params.id || req.body?.id;
   if (id) dismissNotification(id);
   res.json({ ok: true });
 });
 
-app.post('/api/notifications/dismiss', requireAuth, requireCsrf, (req, res) => {
+app.post('/api/notifications/dismiss', requireRole('admin'), requireCsrf, (req, res) => {
   const id = req.body?.id;
   if (id) dismissNotification(id);
   res.json({ ok: true });
 });
 
-app.post('/api/notifications/clear', requireAuth, requireCsrf, (req, res) => {
+app.post('/api/notifications/clear', requireRole('admin'), requireCsrf, (req, res) => {
   clearNotifications();
   res.json({ ok: true });
 });
