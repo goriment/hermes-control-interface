@@ -1,4 +1,11 @@
-import { t } from './core/state.js';
+import { t, state as hciState } from './core/state.js';
+// UI convenience only: the SERVER enforces every permission (see lib/rbac.js). Hiding a control
+// here never grants or removes access.
+function kbCan(perm) {
+  const u = hciState.user;
+  if (!u) return false;
+  return u.role === 'admin' || !!(u.permissions && u.permissions[perm]);
+}
 // ═══════════════════════════════════════════════════════════════════════════
 // OFFICE v3 — ZOO Swarm Monitor
 // 3-panel dashboard: Agent Health | Kanban Pipeline | Live Feed
@@ -86,7 +93,7 @@ async function fetchDataAndPatch() {
       if (res?.ok) { agentStates = res.agents || []; patchAgentPanel(); patchKanbanPanel(); }
     })
     .catch(() => null);
-  const eventsP = fetch('/api/office/events')
+  const eventsP = (hciState.user && hciState.user.role !== 'admin' ? Promise.resolve({ json: async () => ({ ok: false }) }) : fetch('/api/office/events'))
     .then(r => r.json())
     .then(res => {
       if (res?.ok) { eventsData = res.events || []; patchEventPanel(); }
@@ -763,14 +770,18 @@ window.showKanbanTask = async function(taskId) {
       const p = decisionEvent?.payload ? (typeof decisionEvent.payload === 'string' ? JSON.parse(decisionEvent.payload) : decisionEvent.payload) : null;
       decisionReason = p?.reason || '';
     } catch (_) {}
-    const decisionHtml = ['triage','blocked','review'].includes(task.status) ? `
+    const canComment = kbCan('office.comment');
+    const canDecide = kbCan('office.decide');
+    const isAdminUi = hciState.user && hciState.user.role === 'admin';
+    const decisionStatuses = isAdminUi ? ['triage','blocked','review'] : ['blocked','review'];
+    const decisionHtml = (canComment || canDecide) && decisionStatuses.includes(task.status) ? `
       <div class="kb-detail-section" style="border:1px solid var(--border-color);padding:12px;border-radius:10px;">
         <div class="kb-detail-label">🧠 Human Decision</div>
         ${decisionReason ? `<div style="white-space:pre-wrap;line-height:1.45;margin:8px 0;color:var(--text-primary);">${esc(decisionReason)}</div>` : ''}
         <textarea id="kb-decision-text" rows="5" placeholder="Type a decision, answer, or instruction for the agent…" style="width:100%;resize:vertical;margin:8px 0;padding:10px;border-radius:8px;"></textarea>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn btn-sm" onclick="submitKanbanDecision('${esc(task.id)}', false)">💾 Save decision</button>
-          <button class="btn btn-sm kb-action--approve" onclick="submitKanbanDecision('${esc(task.id)}', true)">▶ Save & queue agent</button>
+          ${canComment ? `<button class="btn btn-sm" onclick="submitKanbanDecision('${esc(task.id)}', false)">💾 Save comment</button>` : ''}
+          ${canDecide ? `<button class="btn btn-sm kb-action--approve" onclick="submitKanbanDecision('${esc(task.id)}', true)">▶ Save decision & queue agent</button>` : ''}
         </div>
         <div class="kb-detail-error" style="color:var(--danger);margin-top:6px;"></div>
       </div>
@@ -805,12 +816,12 @@ window.showKanbanTask = async function(taskId) {
       <div class="kb-detail-tab-content" id="kb-tab-details">${detailsContent}</div>
       <div class="kb-detail-tab-content" id="kb-tab-timeline" style="display:none">${timelineHtmlFull}</div>
       <div class="kb-detail-actions">
-        ${task.status === 'blocked' ? `<button class="btn btn-sm kb-action-btn kb-action--unblock" onclick="kanbanAction('${esc(task.id)}','unblock')">🔓 Unblock</button>` : ''}
-        ${task.status === 'running' || task.status === 'in_progress' ? `<button class="btn btn-sm kb-action-btn kb-action--done" onclick="kanbanAction('${esc(task.id)}','done')">✅ Mark Done</button>` : ''}
-        ${task.status === 'done' ? `<button class="btn btn-sm kb-action-btn kb-action--reopen" onclick="kanbanAction('${esc(task.id)}','reopen')">🔄 Reopen</button>` : ''}
-        ${task.status === 'review' ? `<button class="btn btn-sm kb-action-btn kb-action--approve" onclick="kanbanAction('${esc(task.id)}','done')">✅ Approve</button>` : ''}
-        ${['triage','todo','scheduled','ready'].includes(task.status) ? `<button class="btn btn-sm kb-action-btn kb-action--start" onclick="kanbanAction('${esc(task.id)}','start')">▶ Queue agent</button>` : ''}
-        ${task.status !== 'done' ? `
+        ${!kbCan('office.manage') ? '' : task.status === 'blocked' ? `<button class="btn btn-sm kb-action-btn kb-action--unblock" onclick="kanbanAction('${esc(task.id)}','unblock')">🔓 Unblock</button>` : ''}
+        ${!kbCan('office.manage') ? '' : task.status === 'running' || task.status === 'in_progress' ? `<button class="btn btn-sm kb-action-btn kb-action--done" onclick="kanbanAction('${esc(task.id)}','done')">✅ Mark Done</button>` : ''}
+        ${!kbCan('office.manage') ? '' : task.status === 'done' ? `<button class="btn btn-sm kb-action-btn kb-action--reopen" onclick="kanbanAction('${esc(task.id)}','reopen')">🔄 Reopen</button>` : ''}
+        ${!kbCan('office.manage') ? '' : task.status === 'review' ? `<button class="btn btn-sm kb-action-btn kb-action--approve" onclick="kanbanAction('${esc(task.id)}','done')">✅ Approve</button>` : ''}
+        ${!kbCan('office.manage') ? '' : ['triage','todo','scheduled','ready'].includes(task.status) ? `<button class="btn btn-sm kb-action-btn kb-action--start" onclick="kanbanAction('${esc(task.id)}','start')">▶ Queue agent</button>` : ''}
+        ${kbCan('office.manage') && task.status !== 'done' ? `
           <select class="kb-reassign-select" onchange="kanbanAction('${esc(task.id)}','reassign', this.value); this.value='';" style="display:inline-block;margin-left:4px;">
             <option value="">🔄 Reassign…</option>
             ${['gptsupervisor','gorimentpm','gorimentdev','gorimentcanary','default'].filter(a => a !== task.assignee).map(a => `<option value="${a}">→ ${a}</option>`).join('')}

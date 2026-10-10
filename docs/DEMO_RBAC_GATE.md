@@ -103,3 +103,21 @@ PM
 ## 9. Decision record
 
 Current decision: NO-GO. Basis: static review shows D1-D3 critical authorization gaps (any authenticated Demo Viewer can write files, mutate kanban tasks, open terminal sessions); no Dev, Ops or QA evidence attached; no expiry mechanism; main checkout dirty. No test evidence exists, so no GO may be claimed.
+
+## 9. Implementation status (card t_2b292174, branch dev/t_2b292174-demo-rbac)
+
+Implemented in lib/rbac.js (pure policy), auth.js (accounts, per-request principal) and server.js (route guards):
+
+- New roles `demo-viewer` and `reviewer` (restricted). Their permissions come ONLY from the code preset; any stored `permissions` on the record is ignored.
+- Per-request principal: role, permissions, allowed_profiles, allowed_boards, reviewer_scope and expires_at are re-read from the user store on every HTTP request and every WebSocket message. Expiry, role change, password reset and logout take effect immediately (open sockets are closed).
+- Default-deny gate: restricted roles may reach only the route allow-list in `ROUTE_POLICY` (lib/rbac.js); every other /api, /usage, /internal and /plugins path returns 403 and is audited. New routes are therefore denied for them until explicitly listed.
+- Account policy enforced at create/update: restricted roles need non-wildcard allowed_profiles, explicit allowed_boards, `expires_at` within 7 days, and (reviewer) `reviewer_scope.task_ids`.
+- Kanban: board allow-list; tasks filtered by profile (assignee) and, for reviewers, by task id; out-of-scope task => 404 (no existence oracle); non-admin task rows are projected (no workspace_path, claim_lock, worker pid); runs / event payloads withheld; links to hidden tasks removed. Actions are authorized per action (`comment`, `respond`/`decision`); decisions are only valid while the task is blocked/review; the author is the real username (no more `hci-admin`).
+- D1-D6 fixed: workspace/file, terminal ensure/exec, files/explorer/workspace, memory, mcp, setup, skills/check, layout/avatar writes, hermes-cron, sessions/logs/usage now require a permission and (where profile data) a permitted profile; endpoints that span all profiles require an all-profiles principal. Sensitive paths (.env, auth.json, hci-users.json, *.db, vault, tokens, other profiles) are blocked for non-admins even with files.read.
+- WebSocket: dashboard snapshot is redacted per principal; terminal, logs, chat actions are re-authorized per message.
+- Legacy `viewer`/`custom` accounts keep working; `viewer` no longer reaches previously unguarded mutation routes.
+
+Tests: `node --test test/rbac.test.js` boots the real server on a temp HOME (HCI_AUTH_HOME) with seeded profiles and boards and exercises allow + deny paths for every role, plus a static route-inventory guard that fails when a new route has no authorization guard.
+Test-only env overrides: HCI_AUTH_HOME, HCI_LOGIN_RATE_MAX, HCI_GLOBAL_RATE_MAX.
+
+Not covered / follow-ups: audit of successful read events; rotation of the existing `demo-reviewer` account (re-provision with a preset + expiry); a sanitised demo profile/board (owner decision, section 8); /internal/cron shared-secret path is unchanged; no penetration test beyond the automated suite; the running instance on :3011 was not touched or restarted.

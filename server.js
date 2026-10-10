@@ -221,7 +221,7 @@ app.use(express.static(path.join(__dirname, 'dist'), {
 // Global: 150 req/min per IP across all endpoints
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 150,
+  max: Number(process.env.HCI_GLOBAL_RATE_MAX) || 150, // override only for automated tests
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests — slow down' },
@@ -455,12 +455,16 @@ function getDefaultModel(profile) {
 }
 
 // GET /api/gateway/ports — discovered gateway API ports per profile
-app.get('/api/gateway/ports', requireAuth, (req, res) => {
-  res.json({ ports: gatewayPorts, profiles: Object.keys(gatewayPorts) });
+app.get('/api/gateway/ports', requireAuth, requirePerm('gateway.view'), (req, res) => {
+  const user = getCurrentUser(req);
+  const names = Object.keys(gatewayPorts).filter((n) => rbac.canAccessProfile(user, n));
+  const ports = {};
+  for (const n of names) ports[n] = gatewayPorts[n];
+  res.json({ ports, profiles: names });
 });
 
 // POST /api/gateway/responses — start a new agent run via Gateway API
-app.post('/api/gateway/responses', requireAuth, requirePerm('chat.use'), async (req, res) => {
+app.post('/api/gateway/responses', requireAuth, requirePerm('chat.use'), requireProfileFrom((r) => r.body && r.body.profile), async (req, res) => {
   const { message, profile, session_id, model, stream = true } = req.body || {};
   if (!message || typeof message !== 'string') return res.status(400).json({ error: 'message required' });
 
@@ -558,7 +562,7 @@ app.post('/api/gateway/responses', requireAuth, requirePerm('chat.use'), async (
   }
 });
 
-app.post('/api/chat/send', requireAuth, requirePerm('chat.use'), chatLimiter, async (req, res) => {
+app.post('/api/chat/send', requireAuth, requirePerm('chat.use'), requireProfileFrom((r) => r.body && r.body.profile), chatLimiter, async (req, res) => {
   const { message, profile, sessionId, model, workspace } = req.body || {};
   if (!message || typeof message !== 'string') return res.status(400).json({ error: 'message required' });
 
@@ -633,7 +637,7 @@ app.post('/api/chat/send', requireAuth, requirePerm('chat.use'), chatLimiter, as
 });
 
 // POST /api/chat/fork — create a new session forked from a source session up to message_index
-app.post('/api/chat/fork', requireAuth, requireCsrf, requirePerm('chat.use'), (req, res) => {
+app.post('/api/chat/fork', requireAuth, requireCsrf, requirePerm('chat.use'), requireProfileFrom((r) => r.body && r.body.profile || r.query && r.query.profile), (req, res) => {
   const { sessionId, messageIndex, profile } = req.body || {};
   if (!sessionId || typeof sessionId !== 'string') {
     return res.status(400).json({ error: 'sessionId required' });
@@ -787,7 +791,7 @@ app.post('/api/chat/fork', requireAuth, requireCsrf, requirePerm('chat.use'), (r
 });
 
 // ── Model Info — read from config.yaml ──
-app.get('/api/models', requireAuth, async (req, res) => {
+app.get('/api/models', requireAuth, requireAnyPerm('chat.use', 'config.view', 'gateway.view', 'office.view'), async (req, res) => {
   try {
     const configPath = path.join(os.homedir(), '.hermes', 'config.yaml');
     const configContent = await fs.promises.readFile(configPath, 'utf-8');
@@ -954,6 +958,98 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: 'authentication required' });
 }
 
+// Profile named by a request source (query/body) or a fallback; must be permitted for the principal.
+function requireProfileFrom(getter, fallback = 'default') {
+  return (req, res, next) => {
+    const user = getCurrentUser(req);
+    if (!user) return res.status(401).json({ error: 'authentication required' });
+    req.hciUser = user;
+    const raw = getter(req);
+    const profile = raw ? sanitizeProfileName(raw) : fallback;
+    if (raw && !profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
+    if (!rbac.canAccessProfile(user, profile)) {
+      return denyRequest(req, res, 403, 'access denied to this profile', `profile=${String(profile).slice(0, 40)}`);
+    }
+    req.hciProfile = profile;
+    next();
+  };
+}
+
+// Aggregate endpoints: ?profile= narrows to one profile (must be permitted); without it the data
+// spans ALL profiles, which profile-scoped accounts may not see.
+function requireProfileOrAll(req, res, next) {
+  const user = getCurrentUser(req);
+  if (!user) return res.status(401).json({ error: 'authentication required' });
+  req.hciUser = user;
+  const raw = req.query.profile;
+  if (raw) {
+    const profile = sanitizeProfileName(raw);
+    if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
+    if (!rbac.canAccessProfile(user, profile)) {
+      return denyRequest(req, res, 403, 'access denied to this profile', `profile=${profile}`);
+    }
+    return next();
+  }
+  if (!hasAllProfiles(user)) return denyRequest(req, res, 403, 'this data spans all profiles; pass ?profile= for a profile you may access');
+  next();
+}
+
+// Kanban board access (restricted roles need an explicit allowed_boards entry).
+function requireBoardAccess(req, res, next) {
+  const user = getCurrentUser(req);
+  if (!user) return res.status(401).json({ error: 'authentication required' });
+  req.hciUser = user;
+  let board = String(req.query.board || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!board) {
+    board = 'main'; // never inferred from the principal: restricted roles must name an approved board
+  }
+  if (!rbac.canAccessBoard(user, board)) {
+    return denyRequest(req, res, 403, 'access denied to this board', `board=${board.slice(0, 40)}`);
+  }
+  req.hciBoard = board;
+  next();
+}
+
+// Task fields non-admins may receive (no workspace paths, claim locks, worker pids…).
+const PUBLIC_TASK_FIELDS = ['id', 'title', 'body', 'assignee', 'status', 'priority', 'created_by', 'created_at', 'started_at', 'completed_at', 'result', 'block_kind'];
+function projectTask(task) {
+  const out = {};
+  for (const k of PUBLIC_TASK_FIELDS) if (k in task) out[k] = task[k];
+  return out;
+}
+function loadVisibleTaskRows(user, board) {
+  const db = openKanbanDB(board);
+  if (!db) return [];
+  try {
+    return db.prepare("SELECT id, assignee, status FROM tasks WHERE status != 'archived'").all()
+      .filter((t) => rbac.canSeeTask(user, board, t));
+  } finally {
+    db.close();
+  }
+}
+
+// Per-principal view of the dashboard snapshot (admin: unchanged).
+function redactDashboardState(state, user) {
+  if (!user || user.role === 'admin') return state;
+  const all = hasAllProfiles(user);
+  const restricted = rbac.isRestricted(user);
+  const s = { ...state };
+  if (!(all && rbac.hasPerm(user, 'sessions.view'))) { s.sessions = []; s.allSessions = []; s.sessionCount = 0; }
+  if (!(all && (rbac.hasPerm(user, 'cron.view') || rbac.hasPerm(user, 'cron.manage')))) s.cronJobs = [];
+  s.profiles = (state.profiles || []).filter((p) => rbac.canAccessProfile(user, p.name || p));
+  if (!rbac.hasPerm(user, 'terminal')) s.terminal = { ready: false, buffer: '', prompt: '', cwd: '', lastError: null };
+  s.explorerRoots = rbac.hasPerm(user, 'files.read') && !restricted ? (state.explorerRoots || []) : [];
+  if (!rbac.hasPerm(user, 'config.view')) {
+    const c = state.configSummary || {};
+    s.configSummary = { defaultModel: c.defaultModel, provider: c.provider, fallbackProvider: c.fallbackProvider, fallbackModel: c.fallbackModel };
+    s.knowledge = '';
+  }
+  if (!(all && rbac.hasPerm(user, 'logs.view'))) s.logs = [];
+  if (!(all && rbac.hasPerm(user, 'usage.view'))) { s.tokens = getTokens(null); s.usage = buildUsageSummary(null); }
+  if (restricted) { s.workingDir = ''; s.loginIdentity = ''; }
+  return s;
+}
+
 function requireProfileAccess(req, res, next) {
   const user = getCurrentUser(req);
   if (!user) return res.status(401).json({ error: 'authentication required' });
@@ -990,7 +1086,7 @@ function getClientIp(req) {
 // Each failed password check also increments the counter via the handler below
 const loginRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 attempts per window
+  max: Number(process.env.HCI_LOGIN_RATE_MAX) || 5, // 5 attempts per window (override only for automated tests)
   keyGenerator: (req) => getClientIp(req),
   handler: (req, res) => {
     log('auth.rate_limited', `ip ${getClientIp(req)}`);
@@ -1021,10 +1117,16 @@ function trimTerminalBuffer(text, limit = 50000) {
   return raw.length > limit ? raw.slice(raw.length - limit) : raw;
 }
 
-function broadcastToClients(message) {
+// `filter(principal)` (optional) re-authorizes each client from its signed session at send time.
+function broadcastToClients(message, filter) {
   const payload = JSON.stringify(message);
   for (const client of wss?.clients || []) {
-    if (client.readyState === 1 && client.authed) client.send(payload);
+    if (client.readyState !== 1 || !client.authed) continue;
+    if (filter) {
+      const who = principalFromToken(client.token);
+      if (!who || !filter(who)) continue;
+    }
+    client.send(payload);
   }
 }
 
@@ -1086,7 +1188,7 @@ function appendTerminalOutput(chunk) {
     ready: terminalSession.ready,
     cwd: terminalSession.cwd,
     prompt: terminalSession.prompt,
-  });
+  }, (who) => rbac.hasPerm(who, 'terminal'));
 }
 
 function ensureTerminalSession() {
@@ -1921,7 +2023,7 @@ function getCurrentUser(req) {
 
 function denyRequest(req, res, status, message, detail) {
   const u = req.hciUser;
-  audit(u ? u.username : 'unknown', u ? u.role : 'unknown', 'DENIED', `${req.method} ${req.path}${detail ? ' (' + detail + ')' : ''}`);
+  audit(u ? u.username : 'unknown', u ? u.role : 'unknown', 'DENIED', `${req.method} ${String(req.originalUrl || req.path).split('?')[0]}${detail ? ' (' + detail + ')' : ''}`);
   return res.status(status).json({ ok: false, error: message });
 }
 
@@ -2212,7 +2314,7 @@ app.post('/api/notifications/clear', requireRole('admin'), requireCsrf, (req, re
 // ============================================
 // System Health API
 // ============================================
-app.get('/api/system/health', requireAuth, async (req, res) => {
+app.get('/api/system/health', requireAuth, requireAnyPerm('gateway.view', 'system.doctor'), async (req, res) => {
   try {
     // Use os module for CPU/RAM (cross-platform, no top/free dependency)
     const memTotalMb = Math.round(os.totalmem() / 1024 / 1024);
@@ -2251,7 +2353,7 @@ app.get('/api/system/health', requireAuth, async (req, res) => {
 });
 
 // System Monitoring — detailed metrics
-app.get('/api/monitoring', requireAuth, async (req, res) => {
+app.get('/api/monitoring', requireAuth, requireAnyPerm('system.doctor', 'logs.view'), requireAllProfiles, async (req, res) => {
   try {
     // Use os module for CPU/RAM (cross-platform)
     const memTotalMb = Math.round(os.totalmem() / 1024 / 1024);
@@ -2331,7 +2433,7 @@ app.get('/api/monitoring', requireAuth, async (req, res) => {
 });
 
 // Hermes agent status (parsed from `hermes status`)
-app.get('/api/agent/status', requireAuth, async (req, res) => {
+app.get('/api/agent/status', requireAuth, requireAnyPerm('gateway.view', 'config.view'), requireAllProfiles, async (req, res) => {
   try {
     const raw = await shell('hermes status 2>&1', '15s');
     const grab = (label) => {
@@ -2403,16 +2505,16 @@ app.get('/api/agent/status', requireAuth, async (req, res) => {
 });
 
 app.get('/api/dashboard-state', requireAuth, async (req, res) => {
-  res.json(await buildDashboardState(true));
+  res.json(redactDashboardState(await buildDashboardState(true), getCurrentUser(req)));
 });
 
-app.get('/api/sessions', requireAuth, async (req, res) => {
+app.get('/api/sessions', requireAuth, requirePerm('sessions.view'), requireAllProfiles, async (req, res) => {
   // Short list for sidebar — limit 10, cached 10s
   const data = await getSessions();
   res.json({ sessions: data, cachedAt: hermesSidebarSessionsCache.at });
 });
 
-app.get('/api/all-sessions', requireAuth, async (req, res) => {
+app.get('/api/all-sessions', requireAuth, requirePerm('sessions.view'), requireProfileOrAll, async (req, res) => {
   // Sessions list — can filter by profile
   const profile = sanitizeProfileName(req.query.profile) || undefined;
   const data = await getAllSessions(profile);
@@ -2527,7 +2629,7 @@ function getGatewayServiceName(profile) {
   };
 }
 
-app.get('/api/gateway/:profile', requireAuth, requireProfileAccess, async (req, res) => {
+app.get('/api/gateway/:profile', requireAuth, requirePerm('gateway.view'), requireProfileAccess, async (req, res) => {
   const profile = sanitizeProfileName(req.params.profile);
   if (!profile) return res.status(400).json({ error: 'invalid profile name' });
   const svcs = getGatewayServiceName(profile);
@@ -2581,7 +2683,7 @@ app.get('/api/gateway/:profile', requireAuth, requireProfileAccess, async (req, 
 });
 
 // Gateway connections (parse from hermes status --all)
-app.get('/api/gateway/:profile/connections', requireAuth, requireProfileAccess, async (req, res) => {
+app.get('/api/gateway/:profile/connections', requireAuth, requirePerm('gateway.view'), requireProfileAccess, async (req, res) => {
   const profile = sanitizeProfileName(req.params.profile);
   if (!profile) return res.status(400).json({ error: 'invalid profile name' });
   try {
@@ -2678,7 +2780,7 @@ app.post('/api/gateway/:profile/:action', requireAuth, requireRole('admin'), req
   }
 });
 
-app.get('/api/gateway/:profile/logs', requireAuth, requireProfileAccess, async (req, res) => {
+app.get('/api/gateway/:profile/logs', requireAuth, requirePerm('logs.view'), requireProfileAccess, async (req, res) => {
   const profile = sanitizeProfileName(req.params.profile);
   if (!profile) return res.status(400).json({ error: 'invalid profile name' });
   const svcs = getGatewayServiceName(profile);
@@ -2704,7 +2806,7 @@ app.get('/api/gateway/:profile/logs', requireAuth, requireProfileAccess, async (
 });
 
 // Gateway health check for a specific profile
-app.get('/api/gateway/:profile/health', requireAuth, requireProfileAccess, async (req, res) => {
+app.get('/api/gateway/:profile/health', requireAuth, requirePerm('gateway.view'), requireProfileAccess, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile) || 'default';
     const port = gatewayPorts[profile];
@@ -2804,8 +2906,15 @@ app.get('/api/gateway/:profile/health', requireAuth, requireProfileAccess, async
   }
 });
 
+// ?profile=all (default) spans every profile; a named profile must be permitted.
+function requireProfileOrAllLogs(req, res, next) {
+  const raw = String(req.query.profile || 'all');
+  if (raw === 'all') return requireAllProfiles(req, res, next);
+  return requireProfileOrAll(req, res, next);
+}
+
 // Unified Logs — all profiles, all sources, with filters
-app.get('/api/logs', requireAuth, requirePerm('logs.view'), async (req, res) => {
+app.get('/api/logs', requireAuth, requirePerm('logs.view'), requireProfileOrAllLogs, async (req, res) => {
   try {
     const profile = String(req.query.profile || 'all');
     const source = String(req.query.source || 'all'); // agent, error, gateway
@@ -2906,19 +3015,37 @@ function parseLogLine(line, profile, source) {
   };
 }
 
-app.get('/api/explorer', requireAuth, (req, res) => {
+// Strip credential/state/other-profile entries from an explorer tree for non-admins.
+function filterExplorerTree(user, nodes) {
+  if (!user || user.role === 'admin') return nodes;
+  return (nodes || [])
+    .filter((n) => !rbac.isSensitivePath(user, n.path, CONTROL_HOME))
+    .map((n) => (n.children && n.children.length ? { ...n, children: filterExplorerTree(user, n.children) } : n));
+}
+
+app.get('/api/explorer', requireAuth, requirePerm('files.read'), (req, res) => {
+  const user = getCurrentUser(req);
+  const shape = (root) => { const r = buildExplorerRoot(root); return { ...r, children: filterExplorerTree(user, r.children) }; };
   const roots = String(req.query.root || '');
   if (roots) {
     const root = ROOTS.find((r) => r.key === roots);
     if (!root) return res.status(404).json({ error: 'unknown root' });
-    return res.json(buildExplorerRoot(root));
+    return res.json(shape(root));
   }
-  return res.json(ROOTS.map(buildExplorerRoot));
+  return res.json(ROOTS.map(shape));
 });
 
-app.get('/api/file', requireAuth, (req, res) => {
+app.get('/api/file', requireAuth, requirePerm('files.read'), (req, res) => {
   const requested = String(req.query.path || '');
   if (!requested) return res.status(400).json({ error: 'path required' });
+  {
+    const user = getCurrentUser(req);
+    const abs = path.resolve(CONTROL_HOME, requested.replace(/^\/+/, ''));
+    if (rbac.isSensitivePath(user, abs, CONTROL_HOME)) {
+      req.hciUser = user;
+      return denyRequest(req, res, 403, 'access to this path is not permitted', 'sensitive path');
+    }
+  }
   try {
     const content = readFileSafe(requested);
     const HERMES = process.env.HERMES_HOME || cfg.hermesHome || path.join(os.homedir(), '.hermes');
@@ -2933,6 +3060,14 @@ app.get('/api/file', requireAuth, (req, res) => {
 app.post('/api/file', requireAuth, requireCsrf, requirePerm('files.write'), (req, res) => {
   const { path: filePath, content } = req.body || {};
   if (!filePath) return res.status(400).json({ error: 'path required' });
+  {
+    const user = getCurrentUser(req);
+    const abs = path.resolve(CONTROL_HOME, String(filePath).replace(/^\/+/, ''));
+    if (rbac.isSensitivePath(user, abs, CONTROL_HOME)) {
+      req.hciUser = user;
+      return denyRequest(req, res, 403, 'access to this path is not permitted', 'sensitive path');
+    }
+  }
   try {
     const result = writeFileSafe(filePath, content);
     log('file.saved', result.path);
@@ -2943,14 +3078,19 @@ app.post('/api/file', requireAuth, requireCsrf, requirePerm('files.write'), (req
 });
 
 // File listing API for File Explorer
-app.get('/api/files/list', requireAuth, (req, res) => {
+app.get('/api/files/list', requireAuth, requirePerm('files.read'), (req, res) => {
   const dirPath = String(req.query.path || '').replace(/^\/+/, '').replace(/\.\./g, '');
   const baseDir = path.join(os.homedir(), '.hermes');
-  
+  const fileUser = getCurrentUser(req);
+
   // Security: ensure we stay within .hermes
   const resolved = path.resolve(baseDir, dirPath);
-  if (!resolved.startsWith(baseDir)) {
+  if (!rbac.isPathInside(baseDir, resolved)) {
     return res.status(403).json({ error: 'path outside allowed roots' });
+  }
+  if (rbac.isSensitivePath(fileUser, resolved, baseDir)) {
+    req.hciUser = fileUser;
+    return denyRequest(req, res, 403, 'access to this path is not permitted', 'sensitive path');
   }
   
   try {
@@ -2963,7 +3103,7 @@ app.get('/api/files/list', requireAuth, (req, res) => {
       return res.status(400).json({ error: 'not a directory' });
     }
     
-    const items = fs.readdirSync(resolved).map(name => {
+    const items = fs.readdirSync(resolved).filter(name => !rbac.isSensitivePath(fileUser, path.join(resolved, name), baseDir)).map(name => {
       try {
         const itemPath = path.join(resolved, name);
         const itemStat = fs.statSync(itemPath);
@@ -3020,7 +3160,7 @@ function saveWorkspace(data) {
   }
 }
 
-app.get('/api/workspace', requireAuth, (req, res) => {
+app.get('/api/workspace', requireAuth, requirePerm('files.read'), (req, res) => {
   const ws = loadWorkspace();
   const listDir = String(req.query.listDir || '');
   let files = null;
@@ -3060,7 +3200,7 @@ app.get('/api/workspace', requireAuth, (req, res) => {
   res.json({ ok: true, path: ws.path, files });
 });
 
-app.post('/api/workspace', requireAuth, requireCsrf, (req, res) => {
+app.post('/api/workspace', requireAuth, requireCsrf, requireRole('admin'), (req, res) => {
   const { path: wsPath } = req.body || {};
   if (!wsPath || typeof wsPath !== 'string') {
     return res.status(400).json({ error: 'path required' });
@@ -3079,7 +3219,7 @@ app.post('/api/workspace', requireAuth, requireCsrf, (req, res) => {
 
 // ── Workspace File Read/Write ──────────────────────────────────────────
 
-app.get('/api/workspace/file', requireAuth, (req, res) => {
+app.get('/api/workspace/file', requireAuth, requirePerm('files.read'), (req, res) => {
   const ws = loadWorkspace();
   if (!ws.path) return res.status(400).json({ error: 'no workspace set' });
 
@@ -3107,7 +3247,7 @@ app.get('/api/workspace/file', requireAuth, (req, res) => {
   }
 });
 
-app.post('/api/workspace/file', requireAuth, requireCsrf, (req, res) => {
+app.post('/api/workspace/file', requireAuth, requireCsrf, requirePerm('files.write'), (req, res) => {
   const ws = loadWorkspace();
   if (!ws.path) return res.status(400).json({ error: 'no workspace set' });
 
@@ -3132,7 +3272,7 @@ app.post('/api/workspace/file', requireAuth, requireCsrf, (req, res) => {
 });
 
 // Ensure terminal session exists
-app.post('/api/terminal/ensure', requireAuth, requireCsrf, (req, res) => {
+app.post('/api/terminal/ensure', requireAuth, requireCsrf, requirePerm('terminal'), (req, res) => {
   try {
     const session = ensureTerminalSession();
     res.json({ ok: true, ready: session.ready, cwd: session.cwd });
@@ -3141,7 +3281,7 @@ app.post('/api/terminal/ensure', requireAuth, requireCsrf, (req, res) => {
   }
 });
 
-app.post('/api/terminal/exec', terminalRateLimiter, requireAuth, requireCsrf, requirePerm('terminal.exec'), async (req, res) => {
+app.post('/api/terminal/exec', terminalRateLimiter, requireAuth, requireCsrf, requirePerm('terminal'), async (req, res) => {
   const command = String(req.body?.command || '').trim();
   if (!command) return res.status(400).json({ error: 'command required' });
   if (command.length > 4096) return res.status(400).json({ error: 'command too long (max 4096 chars)' });
@@ -3213,7 +3353,7 @@ function addCronJob({ schedule, note, source = '/cron add' }) {
   return job;
 }
 
-app.post('/api/cron/:action', requireAuth, requireCsrf, requirePerm('cron.manage'), async (req, res) => {
+app.post('/api/cron/:action', requireAuth, requireCsrf, requirePerm('cron.manage'), requireAllProfiles, async (req, res) => {
   try {
     const result = await handleCronAction(req.params.action, req.body || {}, req.query || {}, '/api/cron');
     return res.json(result);
@@ -3234,26 +3374,26 @@ app.post('/internal/cron/:action', async (req, res) => {
 });
 
 
-app.get('/usage', requireAuth, (req, res) => {
+app.get('/usage', requireAuth, requirePerm('usage.view'), requireAllProfiles, (req, res) => {
   res.json(buildUsageSummary());
 });
 
-app.get('/api/usage', requireAuth, requirePerm('usage.view'), (req, res) => {
+app.get('/api/usage', requireAuth, requirePerm('usage.view'), requireAllProfiles, (req, res) => {
   res.json(buildUsageSummary());
 });
 
-app.get('/api/insights', requireAuth, requirePerm('usage.view'), async (req, res) => {
+app.get('/api/insights', requireAuth, requirePerm('usage.view'), requireAllProfiles, async (req, res) => {
   const days = Math.min(365, Math.max(1, parseInt(req.query.days) || 7));
   const source = String(req.query.source || '').trim();
   const data = await getInsights(days, source);
   res.json({ ok: true, ...data, filter: { days, source: source || 'all' } });
 });
 
-app.get('/api/layout', requireAuth, (req, res) => {
+app.get('/api/layout', requireAuth, requirePerm('office.view'), (req, res) => {
   res.json({ ok: true, layout: readLayoutStore() });
 });
 
-app.post('/api/layout', requireAuth, requireCsrf, (req, res) => {
+app.post('/api/layout', requireAuth, requireCsrf, requireRole('admin'), (req, res) => {
   try {
     const panels = Array.isArray(req.body?.panels) ? req.body.panels : [];
     const normalized = panels
@@ -3275,8 +3415,16 @@ app.post('/api/layout', requireAuth, requireCsrf, (req, res) => {
 
 // ── Office / Departments API ──────────────────────────────────────────────
 
-app.get('/api/office/departments', requireAuth, (req, res) => {
-  res.json({ ok: true, ...readOfficeDepartments() });
+app.get('/api/office/departments', requireAuth, requirePerm('office.view'), (req, res) => {
+  const user = getCurrentUser(req);
+  const data = readOfficeDepartments();
+  if (user.role !== 'admin') {
+    // Only members the principal may see; departments left empty are hidden from restricted roles.
+    data.departments = (data.departments || [])
+      .map((d) => ({ ...d, members: (Array.isArray(d.members) ? d.members : []).filter((m) => rbac.canAccessProfile(user, m)) }))
+      .filter((d) => !rbac.isRestricted(user) || d.members.length > 0);
+  }
+  res.json({ ok: true, ...data });
 });
 
 app.post('/api/office/departments', requireRole('admin'), requireCsrf, (req, res) => {
@@ -3380,7 +3528,7 @@ function parseOfficeAgentState(stdout, profileName) {
 }
 
 // Agent states for office visualization (per-profile read from CLI)
-app.get('/api/office/agent-states', requireAuth, async (req, res) => {
+app.get('/api/office/agent-states', requireAuth, requirePerm('office.view'), requireBoardAccess, async (req, res) => {
   try {
     const deptData = readOfficeDepartments();
     const departments = deptData.departments || [];
@@ -3420,7 +3568,7 @@ app.get('/api/office/agent-states', requireAuth, async (req, res) => {
 
     // FAST hybrid: config.yaml + kanban.db (no subprocess spawn)
     // ~100ms vs ~3000ms for `hermes status`
-    const kanbanDB = openKanbanDB(String(req.query.board || 'main'));
+    const kanbanDB = openKanbanDB(req.hciBoard);
     
     for (const name of namesToQuery) {
       const { department, deptColor, deptId, unassigned } = deptLookup[name];
@@ -3490,9 +3638,20 @@ app.get('/api/office/agent-states', requireAuth, async (req, res) => {
       agents.push(agent);
     }
 
-    const currentUser = getCurrentUser(req);
-    const user = currentUser ? findUser(currentUser.username) : null;
-    const filteredAgents = agents.filter(a => canAccessProfile(user, a.name || a.profile));
+    const user = getCurrentUser(req);
+    const filteredAgents = agents.filter(a => rbac.canAccessProfile(user, a.name || a.profile));
+    if (user.role !== 'admin') {
+      // Task counts / last action must only reflect tasks this principal may see.
+      const vis = loadVisibleTaskRows(user, req.hciBoard);
+      for (const a of filteredAgents) {
+        const mine = vis.filter((t) => t.assignee === a.name);
+        a.activeTasks = mine.filter((t) => t.status === 'running' || t.status === 'in_progress').length;
+        a.blockedTasks = mine.filter((t) => t.status === 'blocked').length;
+        a.totalTasks = mine.length;
+        a.lastAction = null;
+        a.state = !checkAgentAlive(a.name) ? 'stopped' : a.blockedTasks > 0 ? 'blocked' : a.activeTasks > 0 ? 'coding' : 'idle';
+      }
+    }
     res.json({ ok: true, agents: filteredAgents, timestamp: Date.now() });
   } catch (e) {
     res.json({ ok: false, error: e.message });
@@ -3587,11 +3746,7 @@ function collectOfficeEvents() {
 }
 
 // Office event timeline — admin only (may contain tool names, agent internals)
-app.get('/api/office/events', requireAuth, (req, res) => {
-  const user = getCurrentUser(req);
-  if (!user || user.role !== 'admin') {
-    return res.status(403).json({ ok: false, error: 'Forbidden: admin only' });
-  }
+app.get('/api/office/events', requireAuth, requireRole('admin'), (req, res) => {
 
   try {
     let events = collectOfficeEvents();
@@ -3643,9 +3798,10 @@ function openKanbanDBWritable(board) {
   return new Database(dbPath); // writable
 }
 
-app.get('/api/office/kanban', requireAuth, (req, res) => {
+app.get('/api/office/kanban', requireAuth, requirePerm('office.view'), requireBoardAccess, (req, res) => {
   try {
-    const board = String(req.query.board || 'main').replace(/[^a-zA-Z0-9_-]/g, '');
+    const board = req.hciBoard;
+    const kbUser = req.hciUser;
     const db = openKanbanDB(board);
     if (!db) return res.json({ ok: true, board, tasks: [], links: [], columns: [] });
 
@@ -3656,15 +3812,16 @@ app.get('/api/office/kanban', requireAuth, (req, res) => {
       FROM tasks
       WHERE status != 'archived'
       ORDER BY priority ASC, created_at DESC
-      LIMIT 200
-    `).all();
+      LIMIT ${kbUser.role === 'admin' ? 200 : 5000}
+    `).all().filter((t) => kbUser.role === 'admin' || rbac.canSeeTask(kbUser, board, t)).slice(0, 200).map((t) => kbUser.role === 'admin' ? t : projectTask(t));
+    const visibleIds = new Set(tasks.map((t) => t.id));
 
-    // 2. Query dependency links
+    // 2. Query dependency links (only between tasks this principal may see)
     const links = db.prepare(`
       SELECT parent_id, child_id FROM task_links
       WHERE parent_id IN (SELECT id FROM tasks WHERE status != 'archived')
         AND child_id IN (SELECT id FROM tasks WHERE status != 'archived')
-    `).all();
+    `).all().filter((l) => kbUser.role === 'admin' || (visibleIds.has(l.parent_id) && visibleIds.has(l.child_id)));
 
     // 3. Build columns — one per assignee with tasks
     const columnMap = {};
@@ -3699,14 +3856,15 @@ app.get('/api/office/kanban', requireAuth, (req, res) => {
 });
 
 // List available boards
-app.get('/api/office/kanban/boards', requireAuth, (req, res) => {
+app.get('/api/office/kanban/boards', requireAuth, requirePerm('office.view'), (req, res) => {
   try {
     const boardsDir = path.join(CONTROL_HOME, 'kanban', 'boards');
     const boards = [];
+    const boardUser = getCurrentUser(req);
     if (fs.existsSync(boardsDir)) {
       for (const d of fs.readdirSync(boardsDir)) {
         const dbPath = path.join(boardsDir, d, 'kanban.db');
-        if (fs.existsSync(dbPath)) boards.push(d);
+        if (fs.existsSync(dbPath) && rbac.canAccessBoard(boardUser, d)) boards.push(d);
       }
     }
     res.json({ ok: true, boards });
@@ -3716,16 +3874,23 @@ app.get('/api/office/kanban/boards', requireAuth, (req, res) => {
 });
 
 // Task detail — full info including run history, events, comments, attachments
-app.get('/api/office/kanban/:taskId', requireAuth, (req, res) => {
+app.get('/api/office/kanban/:taskId', requireAuth, requirePerm('office.view'), requireBoardAccess, (req, res) => {
   try {
     const taskId = String(req.params.taskId).replace(/[^a-zA-Z0-9_-]/g, '');
-    const board = String(req.query.board || 'main').replace(/[^a-zA-Z0-9_-]/g, '');
+    const board = req.hciBoard;
+    const detailUser = req.hciUser;
     const db = openKanbanDB(board);
     if (!db) return res.json({ ok: false, error: 'board not found' });
 
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
-    if (!task) { db.close(); return res.json({ ok: false, error: 'task not found' }); }
-
+    const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
+    // Out-of-scope tasks are indistinguishable from missing ones (no existence oracle).
+    if (!taskRow || !rbac.canSeeTask(detailUser, board, taskRow)) {
+      db.close();
+      if (taskRow) denyRequest(req, res, 404, 'task not found', `task=${taskId.slice(0, 40)} out of scope`);
+      else res.json({ ok: false, error: 'task not found' });
+      return;
+    }
+    const task = detailUser.role === 'admin' ? taskRow : projectTask(taskRow);
     const runs = db.prepare('SELECT * FROM task_runs WHERE task_id = ? ORDER BY started_at DESC LIMIT 20').all(taskId);
     const events = db.prepare('SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at DESC LIMIT 50').all(taskId);
     const comments = db.prepare('SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at DESC LIMIT 20').all(taskId);
@@ -3733,6 +3898,24 @@ app.get('/api/office/kanban/:taskId', requireAuth, (req, res) => {
     const links = db.prepare('SELECT * FROM task_links WHERE parent_id = ? OR child_id = ?').all(taskId, taskId);
 
     db.close();
+
+    if (detailUser.role !== 'admin') {
+      // Run records and event payloads carry worker pids, lock names and workspace paths: expose
+      // only the neutral timeline, and only links to tasks inside the principal's scope.
+      const linkedIds = new Set();
+      for (const l of links) { linkedIds.add(l.parent_id); linkedIds.add(l.child_id); }
+      const visibleLinked = new Set(loadVisibleTaskRows(detailUser, board).map((t) => t.id));
+      return res.json({
+        ok: true,
+        task,
+        runs: [],
+        events: events.map((e) => ({ id: e.id, task_id: e.task_id, kind: e.kind, created_at: e.created_at })),
+        comments,
+        attachments: attachments.map((a) => ({ id: a.id, task_id: a.task_id, filename: a.filename, content_type: a.content_type, size: a.size, created_at: a.created_at })),
+        links: links.filter((l) => visibleLinked.has(l.parent_id) && visibleLinked.has(l.child_id)),
+        timestamp: Date.now(),
+      });
+    }
 
     res.json({
       ok: true,
@@ -3750,7 +3933,7 @@ app.get('/api/office/kanban/:taskId', requireAuth, (req, res) => {
 });
 
 // ── Read workspace file contents ────────────────────────────────────────────
-app.get('/api/office/kanban/:taskId/workspace-file', requireAuth, (req, res) => {
+app.get('/api/office/kanban/:taskId/workspace-file', requireAuth, requireRole('admin'), (req, res) => {
   try {
     const taskId = String(req.params.taskId).replace(/[^a-zA-Z0-9_-]/g, '');
     const board = String(req.query.board || 'main').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -3804,30 +3987,49 @@ app.get('/api/office/kanban/:taskId/workspace-file', requireAuth, (req, res) => 
 });
 
 // ── Quick actions on kanban tasks (triage from Office) ──
-app.post('/api/office/kanban/:taskId/action', requireAuth, requireCsrf, (req, res) => {
+app.post('/api/office/kanban/:taskId/action', requireAuth, requireCsrf, requireAnyPerm('office.comment', 'office.decide', 'office.manage'), requireBoardAccess, (req, res) => {
   try {
     const taskId = String(req.params.taskId).replace(/[^a-zA-Z0-9_-]/g, '');
-    const board = String(req.query.board || 'main').replace(/[^a-zA-Z0-9_-]/g, '');
+    const board = req.hciBoard;
+    const actor = req.hciUser;
     const { action, assignee, text } = req.body || {};
     const now = Math.floor(Date.now() / 1000);
+
+    // 1. Authorize the ACTION itself before touching the DB.
+    const needPerm = rbac.OFFICE_ACTION_PERMS[action];
+    if (!needPerm) return res.status(400).json({ ok: false, error: `unknown action: ${action}. valid: ${Object.keys(rbac.OFFICE_ACTION_PERMS).join(', ')}` });
+    if (actor.role !== 'admin' && !rbac.hasPerm(actor, needPerm)) {
+      return denyRequest(req, res, 403, `permission required: ${needPerm}`, `action=${action}`);
+    }
 
     const db = openKanbanDBWritable(board);
     if (!db) return res.json({ ok: false, error: 'board not found' });
 
     const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
-    if (!task) { db.close(); return res.json({ ok: false, error: 'task not found' }); }
+    // 2. Scope: non-admins act only on tasks they can see (profile + board + reviewer task list).
+    if (!task || (actor.role !== 'admin' && !rbac.canSeeTask(actor, board, task))) {
+      db.close();
+      if (task) return denyRequest(req, res, 404, 'task not found', `task=${taskId.slice(0, 40)} action=${action} out of scope`);
+      return res.json({ ok: false, error: 'task not found' });
+    }
+    // 3. A human decision is only valid while the task is actually waiting for a human.
+    if (actor.role !== 'admin' && rbac.DECISION_ACTIONS.has(action) && !rbac.DECISION_STATUSES.has(task.status)) {
+      db.close();
+      return denyRequest(req, res, 409, `task is not waiting for a decision (status: ${task.status})`, `action=${action}`);
+    }
+    audit(actor.username, actor.role, 'OFFICE_ACTION', `board=${board} task=${taskId} action=${action}${assignee ? ' assignee=' + String(assignee).slice(0, 32) : ''}`);
 
     const saveDecision = (resume) => {
       const body = String(text || '').trim().slice(0, 8000);
       if (!body) return { error: 'decision text is required' };
-      const author = 'hci-admin';
+      const author = actor.username; // true actor, never a shared 'hci-admin'
       const tx = db.transaction(() => {
         db.prepare('INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)').run(taskId, author, body, now);
         db.prepare('INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)').run(
           taskId,
           task.current_run_id || null,
           'commented',
-          JSON.stringify({ author, len: body.length, source: 'hci-decision' }),
+          JSON.stringify({ author, len: body.length, source: 'hci-decision', role: actor.role }),
           now,
         );
         if (resume) {
@@ -3872,15 +4074,19 @@ app.post('/api/office/kanban/:taskId/action', requireAuth, requireCsrf, (req, re
 });
 
 // ── Office Board Summary ──────────────────────────────────────────────────
-app.get('/api/office/summary', requireAuth, (req, res) => {
+app.get('/api/office/summary', requireAuth, requirePerm('office.view'), requireBoardAccess, (req, res) => {
   try {
-    const board = String(req.query.board || 'main').replace(/[^a-zA-Z0-9_-]/g, '');
+    const board = req.hciBoard;
+    const sumUser = req.hciUser;
     const db = openKanbanDB(board);
     if (!db) return res.json({ ok: false, error: 'board not found' });
 
     const now = Math.floor(Date.now() / 1000);
-    const tasks = db.prepare('SELECT id, title, assignee, status, priority, created_at, started_at FROM tasks WHERE status != ? ORDER BY priority ASC, created_at DESC').all('archived');
-    const links = db.prepare('SELECT parent_id, child_id FROM task_links').all();
+    const tasks = db.prepare('SELECT id, title, assignee, status, priority, created_at, started_at FROM tasks WHERE status != ? ORDER BY priority ASC, created_at DESC').all('archived')
+      .filter((t) => sumUser.role === 'admin' || rbac.canSeeTask(sumUser, board, t));
+    const sumIds = new Set(tasks.map((t) => t.id));
+    const links = db.prepare('SELECT parent_id, child_id FROM task_links').all()
+      .filter((l) => sumUser.role === 'admin' || (sumIds.has(l.parent_id) && sumIds.has(l.child_id)));
     db.close();
 
     const taskMap = {};
@@ -3955,7 +4161,7 @@ app.get('/api/office/summary', requireAuth, (req, res) => {
   }
 });
 
-app.get('/api/avatar', requireAuth, (req, res) => {
+app.get('/api/avatar', requireAuth, requirePerm('office.view'), (req, res) => {
   res.json({ ok: true, url: '/api/avatar/image', custom: !!readAvatarOverride() });
 });
 
@@ -3975,7 +4181,7 @@ app.post('/api/agent/state', requireAuth, requireRole('admin'), requireCsrf, (re
   return res.json({ ok: true, state: target });
 });
 
-app.post('/api/avatar', requireAuth, requireCsrf, express.json({ limit: '10mb' }), (req, res) => {
+app.post('/api/avatar', requireAuth, requireRole('admin'), requireCsrf, express.json({ limit: '10mb' }), (req, res) => {
   const dataUrl = String(req.body?.dataUrl || '').trim();
   if (!dataUrl) return res.status(400).json({ error: 'no data' });
   // Accept any image/* data URL with base64 encoding
@@ -3997,7 +4203,7 @@ app.post('/api/avatar', requireAuth, requireCsrf, express.json({ limit: '10mb' }
   return res.json({ ok: true, url: '/api/avatar/image', custom: true });
 });
 
-app.delete('/api/avatar', requireAuth, requireCsrf, (req, res) => {
+app.delete('/api/avatar', requireAuth, requireRole('admin'), requireCsrf, (req, res) => {
   clearAvatarOverride();
   log('avatar.reset', 'avatar reverted to default photo');
   broadcast();
@@ -4292,7 +4498,7 @@ app.get('/api/auth/providers', requireRole('admin'), async (req, res) => {
 });
 
 // Skills list
-app.get('/api/skills', requireAuth, async (req, res) => {
+app.get('/api/skills', requireAuth, requirePerm('skills.browse'), async (req, res) => {
   try {
     const raw = await shell('hermes skills list 2>&1');
     const lines = raw.split('\n');
@@ -4319,7 +4525,7 @@ app.get('/api/skills', requireAuth, async (req, res) => {
 });
 
 // Config show
-app.get('/api/config/:profile', requireAuth, requireProfileAccess, async (req, res) => {
+app.get('/api/config/:profile', requireAuth, requirePerm('config.view'), requireProfileAccess, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
@@ -4478,7 +4684,7 @@ function getKeyMeta(name) {
 }
 
 // Keys (secrets) — list keys from .env with category metadata
-app.get('/api/keys/:profile', requireAuth, requireProfileAccess, async (req, res) => {
+app.get('/api/keys/:profile', requireAuth, requirePerm('secrets.view'), requireProfileAccess, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
@@ -4607,7 +4813,7 @@ app.delete('/api/keys/:profile/:name', requireAuth, requireRole('admin'), requir
 });
 
 // Memory data
-app.get('/api/memory/:profile', requireAuth, async (req, res) => {
+app.get('/api/memory/:profile', requireAuth, requirePerm('sessions.view'), requireProfileAccess, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
@@ -4666,7 +4872,7 @@ app.get('/api/memory/:profile', requireAuth, async (req, res) => {
 
 // Profiles list (for skill install picker)
 // Skills browse (paginated)
-app.get('/api/skills/browse/:page', requireAuth, async (req, res) => {
+app.get('/api/skills/browse/:page', requireAuth, requirePerm('skills.browse'), async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.params.page) || 1);
     const output = await execHermes(['skills', 'browse', '--page', String(page)], 15000);
@@ -4677,7 +4883,7 @@ app.get('/api/skills/browse/:page', requireAuth, async (req, res) => {
 });
 
 // Skills search — use execHermes to prevent shell injection
-app.get('/api/skills/search/:query', requireAuth, async (req, res) => {
+app.get('/api/skills/search/:query', requireAuth, requirePerm('skills.browse'), async (req, res) => {
   try {
     const query = decodeURIComponent(req.params.query);
     const output = await execHermes(['skills', 'search', query], 15000);
@@ -4707,7 +4913,7 @@ app.get('/api/skills/search/:query', requireAuth, async (req, res) => {
 });
 
 // Skills inspect (preview) — use execHermes to prevent shell injection
-app.get('/api/skills/inspect/:name', requireAuth, async (req, res) => {
+app.get('/api/skills/inspect/:name', requireAuth, requirePerm('skills.browse'), async (req, res) => {
   try {
     const name = decodeURIComponent(req.params.name);
     const output = await execHermes(['skills', 'inspect', name], 15000);
@@ -4718,7 +4924,7 @@ app.get('/api/skills/inspect/:name', requireAuth, async (req, res) => {
 });
 
 // Skills list (installed for a profile)
-app.get('/api/skills/list/:profile', requireAuth, async (req, res) => {
+app.get('/api/skills/list/:profile', requireAuth, requirePerm('skills.browse'), requireProfileAccess, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
@@ -4775,7 +4981,7 @@ app.post('/api/skills/update', requireRole('admin'), requireCsrf, async (req, re
 });
 
 // Skills check updates
-app.post('/api/skills/check', requireAuth, requireCsrf, async (req, res) => {
+app.post('/api/skills/check', requireAuth, requireCsrf, requirePerm('skills.install'), requireProfileFrom((r) => r.body && r.body.profile), async (req, res) => {
   try {
     const { profile } = req.body || {};
     const profArg = profile ? ['-p', sanitizeProfileName(profile)] : [];
@@ -5063,7 +5269,7 @@ app.post('/api/sessions/:id/rename', requireAuth, requireRole('admin'), requireC
 });
 
 // Session export
-app.get('/api/sessions/:id/export', requireAuth, async (req, res) => {
+app.get('/api/sessions/:id/export', requireAuth, requirePerm('sessions.view'), requireAllProfiles, async (req, res) => {
   try {
     const sessionId = sanitizeSessionId(req.params.id);
     if (!sessionId) return res.status(400).json({ ok: false, error: 'invalid session id' });
@@ -5079,7 +5285,7 @@ app.get('/api/sessions/:id/export', requireAuth, async (req, res) => {
 
 // Session messages — Phase 1: Message Viewer
 
-app.get('/api/sessions/:id/messages', requireAuth, (req, res) => {
+app.get('/api/sessions/:id/messages', requireAuth, requirePerm('sessions.messages'), requireProfileFrom((r) => r.query.profile), (req, res) => {
   try {
     const sessionId = sanitizeSessionId(req.params.id);
     if (!sessionId) return res.status(400).json({ ok: false, error: 'invalid session id' });
@@ -5151,7 +5357,7 @@ app.delete('/api/sessions/:id', requireAuth, requireRole('admin'), requireCsrf, 
 });
 
 // Session stats
-app.get('/api/sessions/stats', requireAuth, async (req, res) => {
+app.get('/api/sessions/stats', requireAuth, requirePerm('sessions.view'), requireAllProfiles, async (req, res) => {
   try {
     const output = await shell('hermes sessions stats 2>&1');
     res.json({ ok: true, stats: output });
@@ -5161,7 +5367,7 @@ app.get('/api/sessions/stats', requireAuth, async (req, res) => {
 });
 
 // Token usage / insights
-app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, res) => {
+app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), requireProfileOrAll, async (req, res) => {
   try {
     const days = Math.min(parseInt(req.params.days || '7', 10), 90);
     const profile = sanitizeProfileName(req.query.profile) || undefined;
@@ -5373,7 +5579,7 @@ function parseInsights(raw) {
 }
 
 // Daily usage breakdown (for charts) — queries state.db directly
-app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async (req, res) => {
+app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), requireProfileFrom((r) => r.query.profile), async (req, res) => {
   try {
     const days = Math.min(parseInt(req.params.days || '7', 10), 90);
     const profile = sanitizeProfileName(req.query.profile);
@@ -5589,7 +5795,7 @@ app.delete('/api/profiles/:name', requireRole('admin'), requireCsrf, async (req,
 });
 
 // Agent insights (per profile)
-app.get('/api/insights/:profile/:days', requireAuth, requirePerm('usage.view'), async (req, res) => {
+app.get('/api/insights/:profile/:days', requireAuth, requirePerm('usage.view'), requireProfileAccess, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
@@ -5631,7 +5837,7 @@ function parseCronList(raw) {
 }
 
 // List jobs
-app.get('/api/hermes-cron/:profile', requireAuth, async (req, res) => {
+app.get('/api/hermes-cron/:profile', requireAuth, requirePerm('cron.view'), requireProfileAccess, async (req, res) => {
   try {
     const profile = sanitizeProfileName(req.params.profile);
     if (!profile) return res.status(400).json({ ok: false, error: 'invalid profile name' });
@@ -5752,7 +5958,7 @@ server.on('connection', (conn) => {
 
 // ── Setup Health Check ──
 // Validates HCI configuration: hermes CLI, gateway API, TUI bridge, config
-app.get('/api/setup/check', requireAuth, async (req, res) => {
+app.get('/api/setup/check', requireAuth, requireRole('admin'), async (req, res) => {
   const results = [];
 
   // 1. Check hermes CLI available
@@ -6006,7 +6212,7 @@ function _getMcpLogs(serverName) {
 }
 
 // GET /api/mcp/servers — list all servers
-app.get('/api/mcp/servers', requireAuth, async (req, res) => {
+app.get('/api/mcp/servers', requireAuth, requirePerm('config.view'), async (req, res) => {
   try {
     const mcpConfig = _getMcpConfig();
     const servers = [];
@@ -6048,7 +6254,7 @@ app.get('/api/mcp/servers', requireAuth, async (req, res) => {
 });
 
 // GET /api/mcp/servers/:name — server detail
-app.get('/api/mcp/servers/:name', requireAuth, async (req, res) => {
+app.get('/api/mcp/servers/:name', requireAuth, requirePerm('config.view'), async (req, res) => {
   const { name } = req.params;
   const mcpConfig = _getMcpConfig();
   if (!mcpConfig[name]) return res.status(404).json({ ok: false, error: 'server not found' });
@@ -6092,14 +6298,14 @@ app.get('/api/mcp/servers/:name', requireAuth, async (req, res) => {
 });
 
 // GET /api/mcp/servers/:name/tools — tools list with schema
-app.get('/api/mcp/servers/:name/tools', requireAuth, async (req, res) => {
+app.get('/api/mcp/servers/:name/tools', requireAuth, requirePerm('config.view'), async (req, res) => {
   const { name } = req.params;
   const tools = await _getMcpTools(name);
   res.json({ ok: true, tools });
 });
 
 // GET /api/mcp/servers/:name/logs — logs
-app.get('/api/mcp/servers/:name/logs', requireAuth, async (req, res) => {
+app.get('/api/mcp/servers/:name/logs', requireAuth, requirePerm('config.view'), async (req, res) => {
   const { name } = req.params;
   res.json({ ok: true, logs: _getMcpLogs(name) });
 });
@@ -6240,7 +6446,7 @@ app.post('/api/mcp/servers/:name/test', requireAuth, requireRole('admin'), requi
 });
 
 // GET /api/mcp/servers/:name/config — server config
-app.get('/api/mcp/servers/:name/config', requireAuth, async (req, res) => {
+app.get('/api/mcp/servers/:name/config', requireAuth, requirePerm('config.edit'), async (req, res) => {
   const { name } = req.params;
   const mcpConfig = _getMcpConfig();
   if (!mcpConfig[name]) return res.status(404).json({ ok: false, error: 'server not found' });
@@ -6453,24 +6659,27 @@ const wss = new WebSocketServer({
 
 async function broadcast() {
   const state = await buildDashboardState(true);
-  const payload = JSON.stringify({ type: 'snapshot', payload: state });
   for (const client of wss.clients) {
-    if (client.readyState === 1 && client.authed) client.send(payload);
+    if (client.readyState !== 1 || !client.authed) continue;
+    const who = principalFromToken(client.token);
+    if (!who) continue;
+    client.send(JSON.stringify({ type: 'snapshot', payload: redactDashboardState(state, who) }));
   }
 }
 
 wss.on('connection', async (socket, req) => {
+  socket.token = parseCookies(req)[AUTH_COOKIE];
   socket.authed = isAuthed(req);
-  socket.user = getCurrentUser(req); // store for permission checks
+  socket.user = getCurrentUser(req); // initial snapshot only; every message re-resolves the principal
   socket.clientId = 'c' + Math.random().toString(36).slice(2) + Date.now().toString(36);
   socket.activeChatReader = null; // for cancelling gateway streams
   if (!socket.authed) {
     socket.send(JSON.stringify({ type: 'auth-required', message: 'authentication required' }));
     return;
   }
-  const state = await buildDashboardState(true);
+  const state = redactDashboardState(await buildDashboardState(true), socket.user);
   socket.send(JSON.stringify({ type: 'snapshot', payload: state }));
-  if (terminalSession.buffer) {
+  if (terminalSession.buffer && rbac.hasPerm(socket.user, 'terminal')) {
     socket.send(JSON.stringify({
       type: 'terminal-transcript',
       buffer: terminalSession.buffer,
@@ -6485,7 +6694,12 @@ wss.on('connection', async (socket, req) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'ping') socket.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
-      if (msg.type === 'terminal-input' && socket.authed && (socket.user?.role === 'admin' || socket.user?.permissions?.terminal)) {
+      // Re-authorize on EVERY message: expiry, role change, password reset and logout apply to open sockets.
+      const wsUser = principalFromToken(socket.token);
+      if (!wsUser) { socket.authed = false; try { socket.close(1008, 'session expired'); } catch {} return; }
+      socket.user = wsUser;
+      const can = (p) => rbac.hasPerm(wsUser, p);
+      if (msg.type === 'terminal-input' && socket.authed && can('terminal')) {
         let data = String(msg.data || '');
         if (data.length > 4096) return;
         data = data.replace(/\x1b\[[0-9;]*R/g, '').replace(/;[0-9]+R/g, '');
@@ -6503,23 +6717,28 @@ wss.on('connection', async (socket, req) => {
         const session = ensureTerminalSession();
         if (session.proc) session.proc.write(data);
       }
-      if (msg.type === 'terminal-resize' && socket.authed && (socket.user?.role === 'admin' || socket.user?.permissions?.terminal)) {
+      if (msg.type === 'terminal-resize' && socket.authed && can('terminal')) {
         const cols = Number(msg.cols || 120);
         const rows = Number(msg.rows || 32);
         terminalSession.cols = cols;
         terminalSession.rows = rows;
         if (terminalSession.proc && terminalSession.proc.resize) terminalSession.proc.resize(cols, rows);
       }
-      if (msg.type === 'log-start' && socket.authed) {
+      if (msg.type === 'log-start' && socket.authed && can('logs.view') && hasAllProfiles(wsUser)) {
         startLogStream(msg.logType || 'agent', msg.level || '', socket);
       }
       if (msg.type === 'log-stop' && socket.authed) {
         stopLogStream();
       }
       // ── Chat via WebSocket (TUI Gateway) ──
-      if (msg.type === 'chat.start' && socket.authed) {
+      if (msg.type === 'chat.start' && socket.authed && can('chat.use')) {
         console.log(`[WS] chat.start received profile="${msg.profile || 'default'}" session_id="${msg.session_id || 'null'}"`);
         const profileName = msg.profile || 'default';
+        if (!rbac.canAccessProfile(wsUser, profileName)) {
+          audit(wsUser.username, wsUser.role, 'DENIED', `WS chat.start profile=${String(profileName).slice(0, 40)}`);
+          socket.send(JSON.stringify({ type: 'chat.error', error: 'access denied to this profile' }));
+          return;
+        }
         if (socket.tuiBridge && socket.tuiBridge.profile !== profileName) {
           socket.tuiBridge.removeClient(socket);
           socket.tuiBridge = null;
@@ -6555,12 +6774,17 @@ wss.on('connection', async (socket, req) => {
           socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
         }
       }
-      if (msg.type === 'chat.stop' && socket.authed && socket.tuiBridge) {
+      if (msg.type === 'chat.stop' && socket.authed && can('chat.use') && socket.tuiBridge) {
         socket.tuiBridge.chatStop(msg.session_id || socket.tuiSessionId);
       }
-      if (msg.type === 'chat.send' && socket.authed) {
+      if (msg.type === 'chat.send' && socket.authed && can('chat.use')) {
         try {
           const profileName = msg.profile || 'default';
+          if (!rbac.canAccessProfile(wsUser, profileName)) {
+            audit(wsUser.username, wsUser.role, 'DENIED', `WS chat.send profile=${String(profileName).slice(0, 40)}`);
+            socket.send(JSON.stringify({ type: 'chat.error', error: 'access denied to this profile' }));
+            return;
+          }
           if (socket.tuiBridge && socket.tuiBridge.profile !== profileName) {
             socket.tuiBridge.removeClient(socket);
             socket.tuiBridge = null;
@@ -6604,28 +6828,28 @@ wss.on('connection', async (socket, req) => {
           socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
         }
       }
-      if (msg.type === 'clarify.respond' && socket.authed && socket.tuiBridge) {
+      if (msg.type === 'clarify.respond' && socket.authed && can('chat.use') && socket.tuiBridge) {
         try {
           await socket.tuiBridge.respondClarify(msg.request_id, msg.text, msg.choice);
         } catch (err) {
           socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
         }
       }
-      if (msg.type === 'approval.respond' && socket.authed && socket.tuiBridge) {
+      if (msg.type === 'approval.respond' && socket.authed && can('chat.use') && socket.tuiBridge) {
         try {
           await socket.tuiBridge.respondApproval(msg.approve, msg.command);
         } catch (err) {
           socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
         }
       }
-      if (msg.type === 'sudo.respond' && socket.authed && socket.tuiBridge) {
+      if (msg.type === 'sudo.respond' && socket.authed && can('chat.use') && socket.tuiBridge) {
         try {
           await socket.tuiBridge.respondSudo(msg.request_id, msg.password);
         } catch (err) {
           socket.send(JSON.stringify({ type: 'chat.error', error: err.message }));
         }
       }
-      if (msg.type === 'secret.respond' && socket.authed && socket.tuiBridge) {
+      if (msg.type === 'secret.respond' && socket.authed && can('chat.use') && socket.tuiBridge) {
         try {
           await socket.tuiBridge.respondSecret(msg.request_id, msg.value);
         } catch (err) {
