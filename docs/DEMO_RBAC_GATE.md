@@ -121,3 +121,14 @@ Tests: `node --test test/rbac.test.js` boots the real server on a temp HOME (HCI
 Test-only env overrides: HCI_AUTH_HOME, HCI_LOGIN_RATE_MAX, HCI_GLOBAL_RATE_MAX.
 
 Not covered / follow-ups: audit of successful read events; rotation of the existing `demo-reviewer` account (re-provision with a preset + expiry); a sanitised demo profile/board (owner decision, section 8); /internal/cron shared-secret path is unchanged; no penetration test beyond the automated suite; the running instance on :3011 was not touched or restarted.
+
+## 10. Migration and rollback
+
+Migration (no data migration needed; hci-users.json is backward compatible):
+1. Back up `~/.hermes/hci-users.json` before deploying.
+2. Deploy the branch commit (pin the SHA; the former dirty main checkout changes are included as baseline commit b786a96).
+3. Existing admin/viewer/custom users keep working unchanged. Old tokens stay valid.
+4. Create demo accounts via the admin API (`POST /api/users`) with role `demo-viewer` or `reviewer`, explicit `allowed_profiles` (no `*`), `allowed_boards`, `expires_at` (<= 7 days) and, for reviewer, `reviewer_scope.task_ids`. Re-provision the existing `demo-reviewer` the same way.
+5. Smoke test: log in as the demo user and confirm `/api/office/kanban?board=<approved>` = 200 and `/api/terminal/ensure` = 403.
+
+Rollback: redeploy the previous commit and restore the hci-users.json backup. Unknown roles (`demo-viewer`, `reviewer`) are not understood by the old code, so delete or expire those accounts first (set `expires_at` in the past or `DELETE /api/users/<name>`), otherwise the old build would treat them as unknown roles. Admin accounts are not altered by this change.
