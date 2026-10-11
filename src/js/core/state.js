@@ -14,7 +14,7 @@ Chart.register(...registerables);
 // State
 const state = {
   user: null,
-  page: 'home',
+  page: 'office',
   theme: localStorage.getItem('hci-theme') || 'dark',
   notifications: [],
   notifDisplayLimit: 5,
