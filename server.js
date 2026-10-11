@@ -3172,12 +3172,15 @@ app.get('/api/workspace', requireAuth, requirePerm('files.read'), (req, res) => 
         files = { error: 'workspace directory does not exist or is not a directory' };
       } else {
         const dirPath = listDir === '/' ? baseDir : path.resolve(baseDir, listDir.replace(/^\/+/, ''));
-        if (!dirPath.startsWith(baseDir)) {
+        const wsUser = getCurrentUser(req);
+        if (!rbac.isPathInside(baseDir, dirPath)) {
           files = { error: 'path outside workspace' };
+        } else if (rbac.isSensitivePath(wsUser, dirPath, CONTROL_HOME)) {
+          files = { error: 'access to this path is not permitted' };
         } else if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) {
           files = { error: 'not a directory' };
         } else {
-          const items = fs.readdirSync(dirPath).map(name => {
+          const items = fs.readdirSync(dirPath).filter(name => !rbac.isSensitivePath(wsUser, path.join(dirPath, name), CONTROL_HOME)).map(name => {
             try {
               const itemPath = path.join(dirPath, name);
               const stat = fs.statSync(itemPath);
@@ -3228,7 +3231,14 @@ app.get('/api/workspace/file', requireAuth, requirePerm('files.read'), (req, res
 
   const baseDir = path.resolve(ws.path);
   const absPath = path.resolve(baseDir, requested.replace(/^\/+/, ''));
-  if (!absPath.startsWith(baseDir)) return res.status(403).json({ error: 'path outside workspace' });
+  if (!rbac.isPathInside(baseDir, absPath)) return res.status(403).json({ error: 'path outside workspace' });
+  {
+    const user = getCurrentUser(req);
+    if (rbac.isSensitivePath(user, absPath, CONTROL_HOME)) {
+      req.hciUser = user;
+      return denyRequest(req, res, 403, 'access to this path is not permitted', 'sensitive path');
+    }
+  }
 
   try {
     if (!fs.existsSync(absPath)) return res.status(404).json({ error: 'file not found' });
@@ -3257,7 +3267,14 @@ app.post('/api/workspace/file', requireAuth, requireCsrf, requirePerm('files.wri
 
   const baseDir = path.resolve(ws.path);
   const absPath = path.resolve(baseDir, requested.replace(/^\/+/, ''));
-  if (!absPath.startsWith(baseDir)) return res.status(403).json({ error: 'path outside workspace' });
+  if (!rbac.isPathInside(baseDir, absPath)) return res.status(403).json({ error: 'path outside workspace' });
+  {
+    const user = getCurrentUser(req);
+    if (rbac.isSensitivePath(user, absPath, CONTROL_HOME)) {
+      req.hciUser = user;
+      return denyRequest(req, res, 403, 'access to this path is not permitted', 'sensitive path');
+    }
+  }
 
   try {
     // Ensure parent directory exists

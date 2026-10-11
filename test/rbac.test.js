@@ -113,7 +113,8 @@ async function startServer() {
   mk('rev', 'reviewer', ['alpha'], { allowed_boards: ['demo'], reviewer_scope: { task_ids: ['d1'] }, expires_at: FUTURE() });
   mk('legacyviewer', 'viewer', ['alpha']);
   mk('cust-none', 'custom', ['*'], { permissions: {} });
-  mk('cust-files', 'custom', ['alpha'], { permissions: { 'files.read': true } });
+  mk('cust-files', 'custom', ['alpha', 'default'], { permissions: { 'files.read': true } });
+  mk('cust-scoped-write', 'custom', ['alpha', 'default'], { permissions: { 'files.read': true, 'files.write': true } });
   mk('cust-write', 'custom', ['*'], { permissions: { 'files.read': true, 'files.write': true } });
   mk('cust-sess', 'custom', ['alpha'], { permissions: { 'sessions.view': true, 'sessions.messages': true, 'logs.view': true, 'secrets.view': true, 'config.view': true } });
   mk('cust-term', 'custom', ['*'], { permissions: { terminal: false } });
@@ -185,7 +186,7 @@ const clients = {};
 test.before(async () => {
   await startServer();
   clients.admin = await loggedIn('admin', ADMIN_PW);
-  for (const u of ['demo', 'rev', 'legacyviewer', 'cust-none', 'cust-files', 'cust-write', 'cust-sess', 'cust-term']) clients[u] = await loggedIn(u);
+  for (const u of ['demo', 'rev', 'legacyviewer', 'cust-none', 'cust-files', 'cust-scoped-write', 'cust-write', 'cust-sess', 'cust-term']) clients[u] = await loggedIn(u);
 });
 test.after(stopServer);
 
@@ -595,7 +596,7 @@ test('custom roles: permission checks on file/terminal/secret/config routes', as
   await expectDenied(f, 'GET', '/api/file?path=hci-users.json');
   await expectDenied(f, 'GET', '/api/file?path=profiles/alpha/state.db');
   await expectDenied(f, 'GET', '/api/file?path=kanban/boards/demo/kanban.db');
-  await expectDenied(f, 'GET', '/api/file?path=notes.txt', undefined, 'root file belongs to default profile');
+  await expectDenied(clients.legacyviewer, 'GET', '/api/file?path=notes.txt', undefined, 'root file belongs to default profile');
   await expectDenied(f, 'GET', '/api/files/list?path=kanban');
   const lst = await f.get('/api/files/list?path=profiles');
   assert.equal(lst.status, 200);
@@ -739,4 +740,50 @@ test('route inventory: every non-public route has an explicit authorization guar
   }
   assert.ok(count > 100, 'route scan found the routes');
   assert.deepEqual(offenders, [], 'routes with no permission guard');
+});
+
+test('Windows case aliases cannot read, list or write another profile', async () => {
+  if (process.platform !== 'win32') return;
+  const f = clients['cust-files'];
+  const w = clients['cust-scoped-write'];
+  for (const prefix of ['profiles', 'Profiles', 'PROFILES', 'pRoFiLeS']) {
+    const target = prefix + '/BeTa/memories/MEMORY.md';
+    assert.equal(rbac.isSensitivePath({ role: 'custom', allowed_profiles: ['alpha', 'default'] }, path.join(HH, target), HH), true);
+    await expectDenied(f, 'GET', '/api/file?path=' + encodeURIComponent(target));
+    await expectDenied(f, 'GET', '/api/files/list?path=' + encodeURIComponent(prefix + '/BeTa'));
+    await expectDenied(w, 'POST', '/api/file', { path: target, content: 'overwritten' });
+    const own = await f.get('/api/file?path=' + encodeURIComponent(prefix + '/ALPHA/memories/MEMORY.md'));
+    assert.equal(own.status, 200);
+    assert.equal(own.json.content, 'memory of alpha');
+  }
+  assert.equal(fs.readFileSync(path.join(HH, 'profiles/beta/memories/MEMORY.md'), 'utf8'), 'memory of beta');
+});
+
+test('workspace and explorer apply canonical profile boundaries including junctions', async () => {
+  const f = clients['cust-files'];
+  const w = clients['cust-scoped-write'];
+  assert.equal((await clients.admin.post('/api/workspace', { path: HH })).status, 200);
+  const variants = process.platform === 'win32' ? ['profiles', 'Profiles', 'PROFILES'] : ['profiles'];
+  for (const prefix of variants) {
+    const target = prefix + '/beta/memories/MEMORY.md';
+    await expectDenied(f, 'GET', '/api/workspace/file?path=' + encodeURIComponent(target));
+    await expectDenied(w, 'POST', '/api/workspace/file', { path: target, content: 'overwritten' });
+    const list = await f.get('/api/workspace?listDir=' + encodeURIComponent(prefix + '/beta'));
+    assert.match(list.json.files.error, /not permitted/);
+    assert.ok(!JSON.stringify(list.json).includes('memory of beta'));
+  }
+  const alias = path.join(HH, 'profiles/alpha/memories/beta-link');
+  fs.symlinkSync(path.join(HH, 'profiles/beta/memories'), alias, process.platform === 'win32' ? 'junction' : 'dir');
+  try {
+    const target = 'profiles/alpha/memories/beta-link/MEMORY.md';
+    await expectDenied(f, 'GET', '/api/file?path=' + encodeURIComponent(target));
+    await expectDenied(w, 'POST', '/api/file', { path: target, content: 'overwritten' });
+    await expectDenied(f, 'GET', '/api/workspace/file?path=' + encodeURIComponent(target));
+    await expectDenied(f, 'GET', '/api/files/list?path=' + encodeURIComponent('profiles/alpha/memories/beta-link'));
+    const explorer = JSON.stringify((await f.get('/api/explorer')).json);
+    assert.ok(!explorer.includes('beta-link'), 'junction to denied profile hidden');
+    await expectDenied(w, 'POST', '/api/file', { path: 'unclassified/new.txt', content: 'new' });
+    assert.equal(rbac.isSensitivePath({ role: 'custom', allowed_profiles: ['default'] }, path.join(HH, 'unclassified/new.txt'), HH), true);
+    assert.equal(fs.readFileSync(path.join(HH, 'profiles/beta/memories/MEMORY.md'), 'utf8'), 'memory of beta');
+  } finally { fs.rmdirSync(alias); }
 });
