@@ -1,7 +1,27 @@
-import { state, t } from './state.js';;
+import { state, t, stopKanbanPoll } from './state.js';;
 import { showToast } from '../components/toast.js';
 
+import { createSessionExpiryHandler } from './session-expiry.mjs';
+
+const handleUnauthorized = createSessionExpiryHandler({
+  state,
+  fetchSession: () => fetch('/api/auth/me', { credentials: 'include', cache: 'no-store' }),
+  onExpired: async () => {
+    showToast(t('toast.sessionExpired'), 'error');
+    window.__csrfToken = null;
+    stopKanbanPoll();
+    clearInterval(state.notifInterval);
+    clearInterval(state._officeInterval);
+    state.notifInterval = null;
+    state._officeInterval = null;
+    const { showLogin } = await import('./auth.js');
+    showLogin();
+  },
+});
+
 async function api(url, options = {}) {
+  if (state.authExpired) return { ok: false, error: 'unauthorized' };
+  const requestGeneration = state.authGeneration || 0;
   try {
     const headers = {
       'Content-Type': 'application/json',
@@ -17,9 +37,7 @@ async function api(url, options = {}) {
       headers,
     });
     if (res.status === 401) {
-      showToast(t('toast.sessionExpired'), 'error');
-      setLocked(true);
-      return { ok: false, error: 'unauthorized' };
+      return handleUnauthorized(requestGeneration);
     }
     if (res.status === 429) {
       showToast(t('toast.rateLimited'), 'warning');
