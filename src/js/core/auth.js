@@ -49,6 +49,8 @@ function showSetup() {
 }
 
 function showApp() {
+  state.authGeneration = (state.authGeneration || 0) + 1;
+  state.authExpired = false;
   document.getElementById('login-overlay').classList.add('hidden');
   document.getElementById('app').style.display = 'block';
   updateUserMenu();
